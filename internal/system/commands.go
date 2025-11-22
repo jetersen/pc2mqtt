@@ -12,38 +12,28 @@ const (
 	LINUX   = "linux"
 )
 
-// Shutdown
-
-var shutdownSystemCommands = map[string]exec.Cmd{
-	WINDOWS: *exec.Command("shutdown", "/s"),
-	MACOS:   *exec.Command("shutdown", "-h", "now"),
-	LINUX:   *exec.Command("poweroff"),
-}
-
 func GetShutdownCommand() (*exec.Cmd, error) {
-	cmd, ok := shutdownSystemCommands[runtime.GOOS]
-
-	if !ok {
+	switch runtime.GOOS {
+	case WINDOWS:
+		return exec.Command("shutdown", "/s"), nil
+	case MACOS:
+		return exec.Command("shutdown", "-h", "now"), nil
+	case LINUX:
+		return exec.Command("systemctl", "poweroff", "--ignore-inhibitors"), nil
+	default:
 		return nil, errors.New(runtime.GOOS + " does not support shutdown")
 	}
-
-	return &cmd, nil
-}
-
-// REBOOT
-
-var rebootSystemCommands = map[string]exec.Cmd{
-	WINDOWS: *exec.Command("shutdown", "/r"),
-	MACOS:   *exec.Command("reboot"),
-	LINUX:   *exec.Command("reboot"),
 }
 
 func GetRebootCommand() (*exec.Cmd, error) {
-	cmd, ok := rebootSystemCommands[runtime.GOOS]
-
-	if !ok {
+	switch runtime.GOOS {
+	case WINDOWS:
+		return exec.Command("shutdown", "/r"), nil
+	case MACOS:
+		return exec.Command("reboot"), nil
+	case LINUX:
+		return exec.Command("systemctl", "reboot", "--ignore-inhibitors"), nil
+	default:
 		return nil, errors.New(runtime.GOOS + " does not support reboot")
 	}
-
-	return &cmd, nil
 }

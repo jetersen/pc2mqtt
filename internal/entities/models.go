@@ -41,5 +41,3 @@ func (button Button) GetDiscoveryConfig() *DiscoveryConfig {
 func (button Button) QueueAction() {
 	go button.Action()
 }
-
-// Disco

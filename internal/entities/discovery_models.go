@@ -1,18 +1,19 @@
 package entities
 
 type DiscoveryConfig struct {
-	Device       Device       `json:"device"`
-	Availability Availability `json:"availability"`
-	CommandTopic string       `json:"command_topic"`
-	Name         string       `json:"name"`
-	Icon         string       `json:"icon"`
-	ObjectId     string       `json:"object_id"`
-	StateTopic   string       `json:"state_topic"`
-	PayloadOn    string       `json:"payload_on"`
-	PayloadOff   string       `json:"payload_off"`
-	UniqueId     string       `json:"unique_id"`
-	Qos          int          `json:"qos"`
-	Schema       string       `json:"schema"`
+	Device            Device       `json:"device"`
+	Availability      Availability `json:"availability"`
+	CommandTopic      string       `json:"command_topic"`
+	Name              string       `json:"name"`
+	Icon              string       `json:"icon"`
+	ObjectId          string       `json:"object_id,omitempty"` // Deprecated: use DefaultEntityId
+	DefaultEntityId   string       `json:"default_entity_id,omitempty"`
+	StateTopic        string       `json:"state_topic"`
+	PayloadOn         string       `json:"payload_on"`
+	PayloadOff        string       `json:"payload_off"`
+	UniqueId          string       `json:"unique_id"`
+	Qos               int          `json:"qos"`
+	Schema            string       `json:"schema"`
 }
 
 type Device struct {

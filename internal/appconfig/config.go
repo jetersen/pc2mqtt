@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/leonlatsch/pc2mqtt/internal/system"
@@ -25,7 +26,7 @@ func RequireConfig() *AppConfig {
 func createEmptyConfig() error {
 	newEmptyConfig := AppConfig{
 		DeviceId:   uuid.New().String(),
-		DeviceName: system.Hostname(),
+		DeviceName: strings.ToLower(system.Hostname()),
 		Mqtt: MqttAppConfig{
 			Host:                "YOUR MQTT HOST",
 			Port:                1883,
@@ -79,6 +80,9 @@ func LoadConfig() error {
 	if err := json.Unmarshal(buf, &conf); err != nil {
 		return err
 	}
+
+	// Ensure device name is lowercase for consistency
+	conf.DeviceName = strings.ToLower(conf.DeviceName)
 
 	localConfig = &conf
 	return nil

@@ -25,66 +25,71 @@ func GetEntities() []Entity {
 					PayloadAvailable:    payloadOnline,
 					PayloadNotAvailable: payloadOffline,
 				},
-				ObjectId:   appConf.DeviceName + "_sensor_power",
-				UniqueId:   appConf.DeviceName + "_sensor_power",
-				Name:       "Power",
-				Icon:       "mdi:power",
-				StateTopic: GetDeviceAvailability().Topic,
-				PayloadOn:  GetDeviceAvailability().PayloadAvailable,
-				PayloadOff: GetDeviceAvailability().PayloadNotAvailable,
-				Qos:        1,
+				DefaultEntityId: "binary_sensor." + appConf.DeviceName + "_sensor_power",
+				UniqueId:        appConf.DeviceName + "_sensor_power",
+				Name:            "Power",
+				Icon:            "mdi:power",
+				StateTopic:      GetDeviceAvailability().Topic,
+				PayloadOn:       GetDeviceAvailability().PayloadAvailable,
+				PayloadOff:      GetDeviceAvailability().PayloadNotAvailable,
+				Qos:             1,
 			},
 		},
 		Button{
 			Action: func() {
-				log.Println("Shutdown button pressed")
+				log.Println("Shutdown button pressed - executing system shutdown")
 				cmd, err := system.GetShutdownCommand()
 				if err != nil {
-					log.Println(err)
+					log.Printf("Failed to get shutdown command: %v", err)
 					return
 				}
 
-				if err := cmd.Run(); err != nil {
-					log.Println(err)
+				if err := cmd.Start(); err != nil {
+					log.Printf("Failed to start shutdown command: %v", err)
+					return
 				}
+				log.Println("System shutdown initiated")
 			},
 			DiscoveryTopic: appConf.Mqtt.AutoDiscoveryPrefix + "/button/" + appConf.DeviceId + "/" + appConf.DeviceName + "_button_shutdown/config",
 			DiscoveryConfig: &DiscoveryConfig{
-				Device:       GetDevice(),
-				Availability: GetDeviceAvailability(),
-				ObjectId:     appConf.DeviceName + "_button_shutdown",
-				UniqueId:     appConf.DeviceName + "_button_shutdown",
-				Name:         "Shutdown",
-				Icon:         "mdi:power",
-				StateTopic:   appConf.DeviceName + "/button/shutdown/state",
-				CommandTopic: appConf.DeviceName + "/button/shutdown/command",
-				Qos:          1,
+				Device:          GetDevice(),
+				Availability:    GetDeviceAvailability(),
+				DefaultEntityId: "button." + appConf.DeviceName + "_button_shutdown",
+				UniqueId:        appConf.DeviceName + "_button_shutdown",
+				Name:            "Shutdown",
+				Icon:            "mdi:power",
+				StateTopic:      appConf.DeviceName + "/button/shutdown/state",
+				CommandTopic:    appConf.DeviceName + "/button/shutdown/command",
+				Qos:             1,
 			},
 		},
 		Button{
 			Action: func() {
-				log.Println("Reboot button pressed")
+				log.Println("Reboot button pressed - executing system reboot")
 				cmd, err := system.GetRebootCommand()
 				if err != nil {
-					log.Println(err)
+					log.Printf("Failed to get reboot command: %v", err)
 					return
 				}
 
-				if err := cmd.Run(); err != nil {
-					log.Println(err)
+				// Use Start() instead of Run() to execute asynchronously
+				if err := cmd.Start(); err != nil {
+					log.Printf("Failed to start reboot command: %v", err)
+					return
 				}
+				log.Println("System reboot initiated")
 			},
 			DiscoveryTopic: appConf.Mqtt.AutoDiscoveryPrefix + "/button/" + appConf.DeviceId + "/" + appConf.DeviceName + "_button_reboot/config",
 			DiscoveryConfig: &DiscoveryConfig{
-				Device:       GetDevice(),
-				Availability: GetDeviceAvailability(),
-				ObjectId:     appConf.DeviceName + "_button_reboot",
-				UniqueId:     appConf.DeviceName + "_button_reboot",
-				Name:         "Reboot",
-				Icon:         "mdi:restart",
-				StateTopic:   appConf.DeviceName + "/button/reboot/state",
-				CommandTopic: appConf.DeviceName + "/button/reboot/command",
-				Qos:          1,
+				Device:          GetDevice(),
+				Availability:    GetDeviceAvailability(),
+				DefaultEntityId: "button." + appConf.DeviceName + "_button_reboot",
+				UniqueId:        appConf.DeviceName + "_button_reboot",
+				Name:            "Reboot",
+				Icon:            "mdi:restart",
+				StateTopic:      appConf.DeviceName + "/button/reboot/state",
+				CommandTopic:    appConf.DeviceName + "/button/reboot/command",
+				Qos:             1,
 			},
 		},
 	}
@@ -97,14 +102,14 @@ func GetEntities() []Entity {
 				},
 				DiscoveryTopic: appConf.Mqtt.AutoDiscoveryPrefix + "/button/" + appConf.DeviceId + "/" + appConf.DeviceName + "_button_test/config",
 				DiscoveryConfig: &DiscoveryConfig{
-					Device:       GetDevice(),
-					Availability: GetDeviceAvailability(),
-					ObjectId:     appConf.DeviceName + "_button_test",
-					UniqueId:     appConf.DeviceName + "_button_test",
-					Name:         "Test",
-					Icon:         "mdi:test-tube",
-					StateTopic:   appConf.DeviceName + "/button/test/state",
-					CommandTopic: appConf.DeviceName + "/button/test/command",
+					Device:          GetDevice(),
+					Availability:    GetDeviceAvailability(),
+					DefaultEntityId: "button." + appConf.DeviceName + "_button_test",
+					UniqueId:        appConf.DeviceName + "_button_test",
+					Name:            "Test",
+					Icon:            "mdi:test-tube",
+					StateTopic:      appConf.DeviceName + "/button/test/state",
+					CommandTopic:    appConf.DeviceName + "/button/test/command",
 				},
 			},
 		)
