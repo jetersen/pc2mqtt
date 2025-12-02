@@ -23,6 +23,8 @@ var (
 )
 
 func main() {
+	log.SetFlags(0)
+
 	log.Println("Starting application")
 
 	if err := appconfig.LoadConfig(); err != nil {
