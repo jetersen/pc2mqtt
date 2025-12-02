@@ -7,6 +7,7 @@ Control your PC or homeserver with homeassistant or any other MQTT enabled home 
 pc2mqtt run on your pc or homeserver and exposes its state and actions via MQTT.
 
 ## Exposed MQTT Components
+
 - Power sensor
 - Shutdown button
 - Reboot button
@@ -36,6 +37,7 @@ Explaination: `wrapped.exe` is the actual binary. pc2mqtt.exe is the windows ser
 ## Config
 
 When first starting the application, a `config.json` will be created right next to it. It looks like this:
+
 ```json
 {
     "device_id": "63fbeebb-f107-4903-ab36-6104b9d802b0",
@@ -63,4 +65,3 @@ When first starting the application, a `config.json` will be created right next 
 | `mqtt.password`             | Your MQTT password.                                                       |                                  |
 | `mqtt.auto_discovery_prefix`| The prefix used for the auto discovery messages.                          | `homeassistant`                  |
 | `debug_mode`                | Enabled debug mode. Prints more logs and adds a "test" button.             |false                              |
-
