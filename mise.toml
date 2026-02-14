@@ -1,0 +1,37 @@
+[tools]
+go = "1.25"
+
+[tasks.build]
+description = "Build pc2mqtt binary"
+run = "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-s -w' -trimpath -o pc2mqtt main.go"
+
+[tasks.deploy]
+description = "Build and deploy pc2mqtt binary to /opt/pc2mqtt"
+depends = ["build"]
+run = "sudo mv pc2mqtt /opt/pc2mqtt/"
+
+[tasks.setup]
+description = "Set up pc2mqtt as a systemd service"
+depends = ["build"]
+run = """
+sudo mkdir -p /opt/pc2mqtt
+sudo mv pc2mqtt /opt/pc2mqtt/
+
+SERVICE_FILE="/etc/systemd/system/pc2mqtt.service"
+sudo bash -c "cat > $SERVICE_FILE" <<EOL
+[Unit]
+Description=PC2MQTT
+
+[Service]
+WorkingDirectory=/opt/pc2mqtt
+ExecStart=/opt/pc2mqtt/pc2mqtt
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+sudo systemctl daemon-reload
+sudo systemctl enable pc2mqtt
+sudo systemctl start pc2mqtt
+"""
