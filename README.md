@@ -1,12 +1,8 @@
 # pc2mqtt
 
-Control your PC or homeserver with homeassistant or any other MQTT enabled home automation system.
+Control your PC or homeserver from Home Assistant through MQTT.
 
-## Usage
-
-pc2mqtt run on your pc or homeserver and exposes its state and actions via MQTT.
-
-## Exposed MQTT Components
+## Exposed MQTT components
 
 - Power sensor
 - Shutdown button
@@ -14,54 +10,49 @@ pc2mqtt run on your pc or homeserver and exposes its state and actions via MQTT.
 
 ![homeassistant](.github/images/homeassistant.png)
 
-## Getting Started / Installation
+## Linux install
 
-> Installation of pc2mqtt works a little different on windows vs linux.
+1. Build or download the `pc2mqtt` binary.
+2. Copy it to `/opt/pc2mqtt/pc2mqtt`.
+3. Run it with systemd.
 
-### Linux
+Example service:
 
-1. Download the latest binary from the releases
-2. Setup a systemd service running the binary on start
-3. Thats it
+```ini
+[Unit]
+Description=PC2MQTT
+After=network-online.target
 
-### Windows
+[Service]
+ExecStart=/opt/pc2mqtt/pc2mqtt
+Restart=always
 
-For windows pc2mqtt uses the [windows-service-wrapper](https://github.com/winsw/winsw).
-
-1. Download the latest windows zip archive from the releases
-2. Unzip it to a directory of your choice
-3. In cmd run `pc2mqtt.exe install` and `pc2mqtt.exe start` to install and start it as a windows service
-
-Explaination: `wrapped.exe` is the actual binary. pc2mqtt.exe is the windows service wrapper which installs the service using the xml config file. For more info have a look at the [windows-service-wrapper](https://github.com/winsw/winsw).
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Config
 
-When first starting the application, a `config.json` will be created right next to it. It looks like this:
+On first start, pc2mqtt creates `/etc/pc2mqtt/config.json` unless `PC2MQTT_CONFIG` points elsewhere.
 
 ```json
 {
-    "device_id": "63fbeebb-f107-4903-ab36-6104b9d802b0",
-    "device_name": "MY-PC-HOSTNAME",
-    "mqtt": {
-        "host": "<YOUR MQTT HOST>",
-        "port": 1883,
-        "username": "<MQTT USER>",
-        "password": "<MQTT PASSWORD>",
-        "auto_discovery_prefix": "homeassistant"
-    },
-    "debug_mode": false
+  "device_id": "63fbeebb-f107-4903-ab36-6104b9d802b0",
+  "device_name": "my-hostname",
+  "mqtt": {
+    "host": "YOUR MQTT HOST",
+    "port": 1883,
+    "username": "MQTT USER",
+    "password": "MQTT PASSWORD",
+    "auto_discovery_prefix": "homeassistant"
+  }
 }
 ```
 
-### Parameter descriptions
+## Build
 
-| Parameter                   | Description                                                              | Default Value                    |
-|-----------------------------|--------------------------------------------------------------------------|----------------------------------|
-| `device_id`                 | A generated id to identify your device.                                   | Generated. Can be changed        |
-| `device_name`               | How your device will be named in eg. homeassistant.                       | Defaults to hostname             |
-| `mqtt.host`                 | Your MQTT hostname eg. 192.168.0.10.                                      |                                  |
-| `mqtt.port`                 | Your MQTT port.                                                           | 1883                             |
-| `mqtt.username`             | Your MQTT username.                                                       |                                  |
-| `mqtt.password`             | Your MQTT password.                                                       |                                  |
-| `mqtt.auto_discovery_prefix`| The prefix used for the auto discovery messages.                          | `homeassistant`                  |
-| `debug_mode`                | Enabled debug mode. Prints more logs and adds a "test" button.             |false                              |
+```sh
+cargo build --release
+```
+
+`--version` prints the embedded git SHA.

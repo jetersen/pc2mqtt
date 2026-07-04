@@ -1,9 +1,0 @@
-version: "3"
-
-services:
-  mosquitto:
-    container_name: mosquitto
-    image: eclipse-mosquitto:latest
-    volumes:
-      - ./config:/mosquitto/config
-

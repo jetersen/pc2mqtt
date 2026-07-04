@@ -1,58 +1,36 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags:
-      - "*"
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
-
   build-linux:
     runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
     steps:
-    - uses: actions/checkout@v3
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.19'
-
-    - name: Build
-      run: go build -v -o pc2mqtt
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: pc2mqtt-linux
-        path: pc2mqtt
-
-  build-windows:
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@v3
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.19'
-
-    - name: Build
-      shell: cmd
-      run: go build -v -o wrapped.exe
-
-    - name: Package
-      shell: cmd
-      run: |
-        powershell -Command "Invoke-WebRequest -Uri https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe -OutFile .\pc2mqtt.exe"
-        rename win_sw.xml pc2mqtt.xml
-    - name: Upload Artifact
-
-      uses: actions/upload-artifact@v4
-      with:
-        name: pc2mqtt-windows
-        path: |
-          wrapped.exe
-          pc2mqtt.exe
-          pc2mqtt.xml
-
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Package
+        run: |
+          name="pc2mqtt-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir -p dist "$name"
+          cp "target/$TARGET/release/pc2mqtt" "$name/"
+          cp README.md LICENSE "$name/"
+          tar -czf "dist/$name.tar.gz" "$name"
+          sha256sum "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
