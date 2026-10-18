@@ -1,14 +1,14 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS};
+use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, process::Command, time::Duration};
 use uuid::Uuid;
 
 const GIT_SHA: &str = env!("GIT_SHA");
-// Max connect burst: 3 discovery publishes + 2 availability publishes + 2 subscribes.
-const MQTT_QUEUE_CAPACITY: usize = 8;
+// Leave room for discovery, availability, and subscriptions before polling again.
+const MQTT_QUEUE_CAPACITY: usize = 16;
 
 fn config_path() -> PathBuf {
     std::env::var_os("PC2MQTT_CONFIG")
@@ -20,15 +20,61 @@ struct Config {
     device_id: String,
     device_name: String,
     mqtt: MqttConfig,
+    #[serde(default)]
+    updates: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 struct MqttConfig {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     host: String,
+    #[serde(default = "default_port")]
     port: u16,
     username: String,
     password: String,
     auto_discovery_prefix: String,
+}
+
+fn default_port() -> u16 {
+    1883
+}
+
+impl MqttConfig {
+    fn options(&self, client_id: String) -> MqttOptions {
+        let Some(endpoint) = &self.url else {
+            return MqttOptions::new(client_id, &self.host, self.port);
+        };
+        let url = url::Url::parse(endpoint).expect("invalid MQTT URL");
+        assert!(
+            url.username().is_empty() && url.password().is_none(),
+            "use the MQTT credential fields"
+        );
+        assert!(
+            url.fragment().is_none() && url.query().is_none(),
+            "MQTT URL must not have a query or fragment"
+        );
+        let host = url.host_str().expect("MQTT URL requires a host");
+        let (transport, port, websocket) = match url.scheme() {
+            "mqtt" => (Transport::Tcp, 1883, false),
+            "mqtts" => (Transport::tls_with_default_config(), 8883, false),
+            "ws" => (Transport::Ws, 80, true),
+            "wss" => (Transport::wss_with_default_config(), 443, true),
+            _ => panic!("MQTT URL scheme must be mqtt, mqtts, ws, or wss"),
+        };
+        assert!(
+            websocket || url.path().is_empty() || url.path() == "/",
+            "TCP MQTT URLs must not have a path"
+        );
+        let mut opts = MqttOptions::new(
+            client_id,
+            if websocket { endpoint } else { host },
+            url.port().unwrap_or(port),
+        );
+        opts.set_transport(transport);
+        opts
+    }
 }
 
 impl Config {
@@ -60,7 +106,9 @@ impl Default for Config {
         Self {
             device_id: Uuid::new_v4().to_string(),
             device_name: hostname.to_lowercase(),
+            updates: false,
             mqtt: MqttConfig {
+                url: Some("wss://YOUR-MQTT-HOST/socket".into()),
                 host: "YOUR MQTT HOST".into(),
                 port: 1883,
                 username: "MQTT USER".into(),
@@ -86,6 +134,7 @@ struct Topics {
     discovery_reboot: String,
     cmd_shutdown: String,
     cmd_reboot: String,
+    cmd_update: String,
 }
 
 impl Topics {
@@ -101,6 +150,7 @@ impl Topics {
             discovery_reboot: format!("{prefix}/button/{id}/{n}_button_reboot/config"),
             cmd_shutdown: format!("{n}/button/shutdown/command"),
             cmd_reboot: format!("{n}/button/reboot/command"),
+            cmd_update: format!("{n}/button/update/command"),
         }
     }
 }
@@ -226,6 +276,21 @@ fn systemctl(op: &str) {
     }
 }
 
+fn accepts_command(retained: bool, payload: &[u8]) -> bool {
+    !retained && payload == b"PRESS"
+}
+
+fn update() {
+    match Command::new("systemctl")
+        .args(["--no-block", "start", "comin-fetch.service"])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("Update request failed: {status}"),
+        Err(error) => eprintln!("Failed to request update: {error}"),
+    }
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("pc2mqtt {GIT_SHA}");
@@ -237,11 +302,7 @@ fn main() {
     let cfg = Config::load();
     let topics = Topics::new(&cfg);
 
-    let mut opts = MqttOptions::new(
-        format!("pc2mqtt-{}", cfg.device_name),
-        &cfg.mqtt.host,
-        cfg.mqtt.port,
-    );
+    let mut opts = cfg.mqtt.options(format!("pc2mqtt-{}", cfg.device_name));
     opts.set_credentials(&cfg.mqtt.username, &cfg.mqtt.password);
     opts.set_keep_alive(Duration::from_mins(1));
     opts.set_last_will(LastWill::new(
@@ -259,7 +320,11 @@ fn main() {
     for event in connection.iter() {
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                println!("Connected to {}:{}", cfg.mqtt.host, cfg.mqtt.port);
+                println!("Connected to MQTT broker");
+                if cfg.updates {
+                    client.subscribe(&topics.cmd_update, QoS::AtLeastOnce).ok();
+                    update();
+                }
 
                 if !initial_connect_done {
                     for (topic, payload) in &discoveries {
@@ -283,13 +348,59 @@ fn main() {
 
                 println!("Ready to receive commands");
             }
-            Ok(Event::Incoming(Packet::Publish(p))) => match p.topic.as_str() {
-                t if t == topics.cmd_shutdown => systemctl("poweroff"),
-                t if t == topics.cmd_reboot => systemctl("reboot"),
-                _ => {}
-            },
+            Ok(Event::Incoming(Packet::Publish(p))) if accepts_command(p.retain, &p.payload) => {
+                match p.topic.as_str() {
+                    t if t == topics.cmd_shutdown => systemctl("poweroff"),
+                    t if t == topics.cmd_reboot => systemctl("reboot"),
+                    t if cfg.updates && t == topics.cmd_update => update(),
+                    _ => {}
+                }
+            }
             Err(e) => eprintln!("Connection error: {e} — retrying..."),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_retained_and_invalid_commands() {
+        assert!(accepts_command(false, b"PRESS"));
+        assert!(!accepts_command(true, b"PRESS"));
+        for payload in [b"".as_slice(), b"press", b"PRESS\n", b"reboot"] {
+            assert!(!accepts_command(false, payload));
+        }
+    }
+
+    #[test]
+    fn secure_websocket_preserves_path_and_port() {
+        let mut config = Config::default();
+        config.mqtt.url = Some("wss://mqtt.example.org/socket".into());
+        let options = config.mqtt.options("test".into());
+        assert_eq!(
+            options.broker_address(),
+            ("wss://mqtt.example.org/socket".into(), 443)
+        );
+        assert!(matches!(options.transport(), Transport::Wss(_)));
+    }
+
+    #[test]
+    fn legacy_config_keeps_updates_disabled() {
+        let config: Config = serde_json::from_str(
+            r#"{
+            "device_id":"test", "device_name":"test",
+            "mqtt":{"host":"localhost", "port":1883,"username":"u",
+            "password":"p","auto_discovery_prefix":"homeassistant"}
+        }"#,
+        )
+        .unwrap();
+        assert!(!config.updates);
+        assert_eq!(
+            config.mqtt.options("test".into()).broker_address(),
+            ("localhost".into(), 1883)
+        );
     }
 }

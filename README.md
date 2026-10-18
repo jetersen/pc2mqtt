@@ -40,14 +40,27 @@ On first start, pc2mqtt creates `/etc/pc2mqtt/config.json` unless `PC2MQTT_CONFI
   "device_id": "63fbeebb-f107-4903-ab36-6104b9d802b0",
   "device_name": "my-hostname",
   "mqtt": {
-    "host": "YOUR MQTT HOST",
-    "port": 1883,
+    "url": "wss://mqtt.jetersen.dev/socket",
     "username": "MQTT USER",
     "password": "MQTT PASSWORD",
     "auto_discovery_prefix": "homeassistant"
   }
 }
 ```
+
+`mqtt.url` supports `mqtt://`, `mqtts://`, `ws://`, and `wss://`. TLS uses the
+system trust store and verifies the broker certificate and hostname. Existing
+`host` and `port` configurations continue to use plain TCP.
+
+Commands require the payload `PRESS`. Retained command replays are ignored.
+Publish commands without retention; MQTT can forward a newly retained publication
+to an existing subscriber without marking it as retained.
+
+On NixOS hosts, set top-level `"updates": true` to enable
+`<device_name>/button/update/command`. This starts the fixed
+`comin-fetch.service` unit, and also requests an update on every broker connection.
+The service account needs permission to start that unit. Leave this disabled on
+hosts without Comin. Use broker ACLs to restrict publishers to the required topics.
 
 ## Build
 
