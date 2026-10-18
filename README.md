@@ -60,10 +60,12 @@ to an existing subscriber without marking it as retained.
 
 On NixOS hosts, set top-level `"updates": true` to enable
 `<device_name>/button/update/command`. pc2mqtt requests a Comin fetch immediately
-when the daemon is active, unsuspended, and idle. Pending requests check readiness
-once per second. One shared update worker blocks when idle; requests do not spawn
-additional workers. A stopped or suspended Comin
-stays that way until explicitly started or resumed. A settled failed generation
+over `/var/lib/comin/grpc.sock` when the daemon is unsuspended and idle. Set
+`PC2MQTT_COMIN_SOCKET` to override this path. The gRPC event stream wakes one shared
+update worker; it uses a single-thread async runtime and never polls readiness.
+Completion events get one brief settling delay because Comin emits some events
+before clearing its busy flags. Requests do not spawn additional workers. A stopped
+or suspended Comin stays that way until explicitly started or resumed. A settled failed generation
 causes an active Comin daemon to restart before fetching the unchanged commit.
 
 QoS 1 update commands are acknowledged after Comin successfully fetches. Persistent
@@ -74,9 +76,12 @@ Retained command replays remain ignored.
 `pc2mqtt --request-update` queues a local request through
 `/run/pc2mqtt/update.sock`, or `PC2MQTT_UPDATE_SOCKET` if set. The socket permits
 access only to the service account. Use this for manual checks and resume/network
-hooks. The service needs `comin`, `systemctl`, and `timeout` on `PATH`, with permission
-to query/fetch Comin and restart its active service after a failure. Leave updates
-disabled on hosts without Comin. Restrict command publishers with broker ACLs.
+hooks. Use a systemd path unit watching Comin's socket with `PathChanged` to invoke
+it when Comin starts or replaces the socket. Socket failures and failed fetches wait
+for another lifecycle, MQTT, or Comin event; there is no periodic retry. The service
+needs access to Comin's socket and `systemctl` on `PATH` solely to restart an active
+daemon after a settled generation failure (Comin 0.14 has no retry-generation RPC).
+Leave updates disabled on hosts without Comin. Restrict command publishers with broker ACLs.
 
 ## Build
 

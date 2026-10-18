@@ -1,6 +1,16 @@
 use std::process::Command;
 
 fn main() {
+    let mut config = tonic_prost_build::Config::new();
+    config.protoc_executable(
+        std::env::var_os("PROTOC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| protoc_bin_vendored::protoc_bin_path().unwrap()),
+    );
+    tonic_prost_build::configure()
+        .compile_with_config(config, &["proto/comin.proto"], &["proto"])
+        .expect("compile Comin protocol");
+    println!("cargo:rerun-if-changed=proto/comin.proto");
     let output = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

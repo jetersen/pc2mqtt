@@ -1,21 +1,18 @@
 use rumqttc::{Client, Publish};
-use serde::Deserialize;
 use std::{
     collections::HashSet,
     fs, io,
     os::unix::{fs::FileTypeExt, fs::PermissionsExt, net::UnixDatagram},
     path::PathBuf,
-    process::{Command, Output},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
-
-const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn socket_path() -> PathBuf {
     std::env::var_os("PC2MQTT_UPDATE_SOCKET")
@@ -27,36 +24,10 @@ pub fn request_local_update() -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct Fetcher {
-    is_fetching: bool,
-}
-
-#[derive(Deserialize)]
-struct Builder {
-    is_evaluating: bool,
-    is_building: bool,
-    generation: Option<Generation>,
-}
-
-#[derive(Deserialize)]
-struct Generation {
-    eval_status: Option<String>,
-    build_status: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Deployer {
-    is_deploying: bool,
-}
-
-#[derive(Deserialize)]
-struct Status {
-    is_suspended: bool,
-    fetcher: Fetcher,
-    builder: Builder,
-    deployer: Deployer,
-}
+use hyper_util::rt::TokioIo;
+use pc2mqtt::comin::{self, comin_client::CominClient};
+use tonic::transport::{Channel, Endpoint};
+use tower::service_fn;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
@@ -65,70 +36,69 @@ enum Decision {
     Fetch,
 }
 
-impl Status {
-    fn decision(&self) -> Decision {
-        if self.is_suspended {
-            return Decision::Wait("Comin is suspended");
-        }
-        if self.fetcher.is_fetching
-            || self.builder.is_evaluating
-            || self.builder.is_building
-            || self.deployer.is_deploying
-        {
-            return Decision::Wait("Comin is busy");
-        }
-        if self.builder.generation.as_ref().is_some_and(|generation| {
-            generation.eval_status.as_deref() == Some("failed")
-                || generation.build_status.as_deref() == Some("failed")
-        }) {
-            return Decision::RestartFailed;
-        }
-        Decision::Fetch
+fn decision(state: &comin::State) -> Decision {
+    let (Some(suspended), Some(fetcher), Some(builder), Some(deployer)) = (
+        state.is_suspended,
+        &state.fetcher,
+        &state.builder,
+        &state.deployer,
+    ) else {
+        return Decision::Wait("Comin state is incomplete");
+    };
+    if suspended || builder.is_suspended == Some(true) || deployer.is_suspended == Some(true) {
+        return Decision::Wait("Comin is suspended");
     }
-}
-
-fn command(seconds: &str, program: &str, args: &[&str]) -> Result<Output, String> {
-    Command::new("timeout")
-        .arg(seconds)
-        .arg(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("could not run {program}: {error}"))
-}
-
-fn successful(seconds: &str, program: &str, args: &[&str]) -> Result<(), String> {
-    let output = command(seconds, program, args)?;
-    if !output.status.success() {
-        return Err(format!(
-            "{program} {} failed: {}",
-            args.join(" "),
-            output.status
-        ));
+    let flags = [
+        fetcher.is_fetching,
+        builder.is_evaluating,
+        builder.is_building,
+        deployer.is_deploying,
+    ];
+    if flags.iter().any(Option::is_none) {
+        return Decision::Wait("Comin state is incomplete");
     }
-    Ok(())
-}
-
-fn try_update() -> Result<Decision, String> {
-    // Never start a stopped daemon or resume a suspended deployment.
-    if !command("5", "systemctl", &["--quiet", "is-active", "comin.service"])?
-        .status
-        .success()
+    if flags.contains(&Some(true)) {
+        return Decision::Wait("Comin is busy");
+    }
+    if builder
+        .generation
+        .as_ref()
+        .is_some_and(|g| g.eval_status == "failed" || g.build_status == "failed")
     {
-        return Ok(Decision::Wait("Comin is stopped"));
+        return Decision::RestartFailed;
     }
-    let output = command("5", "comin", &["status", "--json"])?;
-    if !output.status.success() {
-        return Err(format!("Comin status failed: {}", output.status));
-    }
-    let status: Status = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("invalid Comin status: {error}"))?;
-    match status.decision() {
-        Decision::Fetch => successful("10", "comin", &["fetch"]),
-        // Comin 0.14 does not rebuild an unchanged failed commit after a fetch.
-        Decision::RestartFailed => successful("30", "systemctl", &["try-restart", "comin.service"]),
-        Decision::Wait(_) => return Ok(status.decision()),
-    }?;
-    Ok(status.decision())
+    Decision::Fetch
+}
+
+async fn connect() -> Result<(CominClient<Channel>, tonic::Streaming<comin::Event>), String> {
+    let path = std::env::var_os("PC2MQTT_COMIN_SOCKET")
+        .map_or_else(|| PathBuf::from("/var/lib/comin/grpc.sock"), PathBuf::from);
+    let channel = Endpoint::from_static("http://[::]:50051")
+        .connect_timeout(Duration::from_secs(5))
+        .connect_with_connector(service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(TokioIo::new)
+            }
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut client = CominClient::new(channel);
+    // A streaming RPC's deadline applies to the whole stream. Bound only setup.
+    let events = tokio::time::timeout(Duration::from_secs(5), client.events(()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    Ok((client, events))
+}
+
+async fn state(client: &mut CominClient<Channel>) -> Result<comin::State, tonic::Status> {
+    let mut request = tonic::Request::new(());
+    request.set_timeout(Duration::from_secs(5));
+    Ok(client.get_state(request).await?.into_inner())
 }
 
 struct Receipt {
@@ -141,88 +111,169 @@ enum Request {
     Mqtt(Receipt),
 }
 
-fn next_request(requests: &Receiver<Request>, socket: Option<&UnixDatagram>) -> Option<Request> {
-    let Some(socket) = socket else {
-        return requests.recv().ok();
-    };
-    let mut buffer = [0_u8; 16];
-    loop {
-        if let Ok(request) = requests.try_recv() {
-            return Some(request);
-        }
-        match socket.recv(&mut buffer) {
-            Ok(length) if &buffer[..length] == b"UPDATE" => return Some(Request::Local),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => {
-                eprintln!("Update socket failed: {error}");
-                return None;
-            }
-        }
-    }
-}
-
-fn drain_requests(requests: &Receiver<Request>, socket: Option<&UnixDatagram>) -> Vec<Request> {
-    let mut pending: Vec<_> = requests.try_iter().collect();
-    if let Some(socket) = socket {
-        socket
-            .set_nonblocking(true)
-            .expect("could not drain update socket");
-        let mut buffer = [0_u8; 16];
-        while let Ok(length) = socket.recv(&mut buffer) {
-            if &buffer[..length] == b"UPDATE" {
-                pending.push(Request::Local);
-            }
-        }
-        socket
-            .set_nonblocking(false)
-            .expect("could not wait on update socket");
-    }
-    pending
-}
-
-fn worker(
+fn drain_requests(
     requests: &Receiver<Request>,
-    socket: Option<&UnixDatagram>,
-    mut update: impl FnMut() -> Result<Decision, String>,
-    mut handled: impl FnMut(Vec<Receipt>),
+    socket: &tokio::net::UnixDatagram,
+    pending: &mut Vec<Request>,
 ) {
-    while let Some(first) = next_request(requests, socket) {
-        let mut pending = vec![first];
-        let mut previous = String::new();
-        loop {
-            pending.extend(drain_requests(requests, socket));
-            let message = match update() {
-                Ok(Decision::Fetch) => {
-                    let mut seen = HashSet::new();
-                    let receipts = pending
-                        .into_iter()
-                        .filter_map(|request| match request {
-                            Request::Mqtt(receipt)
-                                if seen.insert((receipt.connection, receipt.publish.pkid)) =>
-                            {
-                                Some(receipt)
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    handled(receipts);
-                    eprintln!("Comin fetched remotes; update request handled");
-                    break;
+    pending.extend(requests.try_iter());
+    let mut buffer = [0; 16];
+    while let Ok(length) = socket.try_recv(&mut buffer) {
+        if &buffer[..length] == b"UPDATE" {
+            pending.push(Request::Local);
+        }
+    }
+}
+
+fn acknowledge(pending: Vec<Request>, client: &Client, connection: &AtomicU64) {
+    let mut seen = HashSet::new();
+    for request in pending {
+        if let Request::Mqtt(receipt) = request
+            && seen.insert((receipt.connection, receipt.publish.pkid))
+            && connection.load(Ordering::SeqCst) == receipt.connection
+            && let Err(error) = client.ack(&receipt.publish)
+        {
+            eprintln!("Could not acknowledge update command: {error}");
+        }
+    }
+}
+
+async fn submit(
+    grpc: &mut Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)>,
+    pending: &mut Vec<Request>,
+    inflight: &mut Vec<Request>,
+    started: &mut prost_types::Timestamp,
+) -> String {
+    let (client, _) = grpc.as_mut().unwrap();
+    match state(client).await {
+        Ok(status) => match decision(&status) {
+            Decision::Wait(reason) => format!("Update pending: {reason}"),
+            Decision::RestartFailed => {
+                // No retry-generation RPC exists in Comin 0.14. This is the
+                // sole subprocess in update handling; never start a stopped service.
+                match Command::new("systemctl")
+                    .args(["--no-block", "try-restart", "comin.service"])
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        "Update pending: restarting Comin after a settled failure".into()
+                    }
+                    _ => "Update pending: could not restart failed Comin".into(),
                 }
-                Ok(Decision::Wait(reason)) => format!("Update pending: {reason}"),
-                Ok(Decision::RestartFailed) => {
-                    "Update pending: restarted Comin after a settled failure".into()
-                }
-                Err(error) => format!("Update pending: {error}"),
-            };
-            if message != previous {
-                eprintln!("{message}");
-                previous = message;
             }
-            // Only pending work checks readiness. Incoming requests coalesce into
-            // this batch; requests arriving during a fetch get their own fetch.
-            thread::sleep(CHECK_INTERVAL);
+            Decision::Fetch => {
+                let mut request = tonic::Request::new(());
+                request.set_timeout(Duration::from_secs(10));
+                *started = SystemTime::now().into();
+                match client.fetch(request).await {
+                    Ok(_) => {
+                        *inflight = std::mem::take(pending);
+                        "Comin fetch submitted; waiting for completion".into()
+                    }
+                    Err(error) => {
+                        *grpc = None;
+                        format!("Update pending: Comin fetch RPC failed: {error}")
+                    }
+                }
+            }
+        },
+        Err(error) => {
+            *grpc = None;
+            format!("Update pending: Comin state RPC failed: {error}")
+        }
+    }
+}
+
+async fn worker(
+    requests: Receiver<Request>,
+    socket: UnixDatagram,
+    mqtt: Client,
+    connection: Arc<AtomicU64>,
+) {
+    socket
+        .set_nonblocking(true)
+        .expect("nonblocking update socket");
+    let socket = tokio::net::UnixDatagram::from_std(socket).expect("async update socket");
+    let mut pending = Vec::new();
+    let mut inflight = Vec::new();
+    let mut started = prost_types::Timestamp::from(SystemTime::UNIX_EPOCH);
+    let mut grpc: Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)> = None;
+    let mut buffer = [0; 16];
+    let mut previous = String::new();
+    loop {
+        let mut settle = false;
+        let mut failed_fetch = false;
+        tokio::select! {
+            received = socket.recv(&mut buffer) => {
+                match received {
+                    Ok(length) if &buffer[..length] == b"UPDATE" => pending.push(Request::Local),
+                    Ok(_) => {},
+                    Err(error) => { eprintln!("Update socket failed: {error}"); return; }
+                }
+            }
+            event = async {
+                match &mut grpc {
+                    Some((_, events)) => events.message().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Ok(Some(event)) = event {
+                    // A previous fetch's event can still be buffered when a new
+                    // request is submitted. Only accept completion after submission.
+                    if let Some(comin::event::Type::Fetched(fetched)) = event.r#type
+                        && event.created_at.is_some_and(|time|
+                            (time.seconds, time.nanos) >= (started.seconds, started.nanos))
+                    {
+                        let success = fetched.repository_status.as_ref().is_some_and(|status|
+                            status.error_msg.is_empty() && status.remotes.iter().all(|r| r.fetch_error_msg.is_empty()));
+                        if success {
+                            if !inflight.is_empty() {
+                                acknowledge(std::mem::take(&mut inflight), &mqtt, &connection);
+                                eprintln!("Comin fetched remotes; update request handled");
+                            }
+                        } else {
+                            pending.append(&mut inflight);
+                            failed_fetch = true;
+                            eprintln!("Update pending: Comin fetch failed; waiting for an event");
+                        }
+                    }
+                    settle = true;
+                } else {
+                    pending.append(&mut inflight);
+                    grpc = connect().await.ok();
+                    // If unavailable, the socket path watch wakes us when ready.
+                    eprintln!("Comin disconnected; waiting for a lifecycle or MQTT event");
+                    continue;
+                }
+            }
+        }
+        // Completion events precede clearing some busy flags in Comin 0.14.
+        // One settling delay per event, never a repeated readiness poll.
+        if settle {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        drain_requests(&requests, &socket, &mut pending);
+        if pending.is_empty() || !inflight.is_empty() || failed_fetch {
+            continue;
+        }
+        if grpc.is_none() {
+            match connect().await {
+                Ok(connected) => grpc = Some(connected),
+                Err(error) => {
+                    eprintln!("Update pending: Comin unavailable: {error}");
+                    continue;
+                }
+            }
+        }
+        let message = submit(&mut grpc, &mut pending, &mut inflight, &mut started).await;
+        if grpc.is_none() {
+            // The socket may already have been replaced before the old channel
+            // reports failure. Reconnect once for this event; never run a retry loop.
+            grpc = connect().await.ok();
+        }
+        if message != previous {
+            eprintln!("{message}");
+            previous = message;
         }
     }
 }
@@ -267,17 +318,11 @@ impl Updates {
         thread::Builder::new()
             .name("pc2mqtt-update".into())
             .spawn(move || {
-                worker(&receiver, Some(&socket), try_update, |receipts| {
-                    for receipt in receipts {
-                        // Old packet IDs belong to the old connection. Persistent
-                        // sessions redeliver unacknowledged commands on reconnect.
-                        if worker_connection.load(Ordering::SeqCst) == receipt.connection
-                            && let Err(error) = client.ack(&receipt.publish)
-                        {
-                            eprintln!("Could not acknowledge update command: {error}");
-                        }
-                    }
-                });
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("update runtime")
+                    .block_on(worker(receiver, socket, client, worker_connection));
             })?;
         let updates = Self {
             requests,
@@ -323,140 +368,49 @@ impl Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    fn idle_status() -> serde_json::Value {
-        serde_json::json!({
-            "is_suspended": false,
-            "fetcher": { "is_fetching": false },
-            "builder": { "is_evaluating": false, "is_building": false, "generation": null },
-            "deployer": { "is_deploying": false }
-        })
-    }
 
     #[test]
-    fn only_idle_unsuspended_complete_status_allows_fetch() {
-        let status = idle_status();
-        assert_eq!(
-            serde_json::from_value::<Status>(status.clone())
-                .unwrap()
-                .decision(),
-            Decision::Fetch
-        );
-        for pointer in [
-            "/is_suspended",
-            "/fetcher/is_fetching",
-            "/builder/is_evaluating",
-            "/builder/is_building",
-            "/deployer/is_deploying",
-        ] {
-            let mut busy = status.clone();
-            *busy.pointer_mut(pointer).unwrap() = true.into();
-            assert!(matches!(
-                serde_json::from_value::<Status>(busy).unwrap().decision(),
-                Decision::Wait(_)
-            ));
+    fn only_complete_idle_unsuspended_state_allows_fetch() {
+        let mut state = comin::State {
+            is_suspended: Some(false),
+            fetcher: Some(comin::Fetcher {
+                is_fetching: Some(false),
+            }),
+            builder: Some(comin::Builder {
+                is_evaluating: Some(false),
+                is_building: Some(false),
+                ..Default::default()
+            }),
+            deployer: Some(comin::Deployer {
+                is_deploying: Some(false),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(decision(&state), Decision::Fetch);
+        for flag in 0..7 {
+            let mut blocked = state.clone();
+            match flag {
+                0 => blocked.is_suspended = Some(true),
+                1 => blocked.fetcher.as_mut().unwrap().is_fetching = Some(true),
+                2 => blocked.builder.as_mut().unwrap().is_evaluating = Some(true),
+                3 => blocked.builder.as_mut().unwrap().is_building = Some(true),
+                4 => blocked.deployer.as_mut().unwrap().is_deploying = Some(true),
+                5 => blocked.builder.as_mut().unwrap().is_suspended = Some(true),
+                _ => blocked.deployer.as_mut().unwrap().is_suspended = Some(true),
+            }
+            assert!(matches!(decision(&blocked), Decision::Wait(_)));
         }
-        for component in ["fetcher", "builder", "deployer"] {
-            let mut incomplete = status.clone();
-            incomplete.as_object_mut().unwrap().remove(component);
-            assert!(serde_json::from_value::<Status>(incomplete).is_err());
-        }
-        let mut failed = status;
-        failed["builder"]["generation"] = serde_json::json!({"eval_status":"failed"});
-        assert_eq!(
-            serde_json::from_value::<Status>(failed).unwrap().decision(),
-            Decision::RestartFailed
-        );
-    }
-
-    fn request(id: u16) -> Request {
-        let mut publish = Publish::new(
-            "test/button/update/command",
-            rumqttc::QoS::AtLeastOnce,
-            "PRESS",
-        );
-        publish.pkid = id;
-        Request::Mqtt(Receipt {
-            connection: 3,
-            publish,
-        })
-    }
-
-    #[test]
-    fn busy_requests_stay_unacknowledged_and_coalesce_when_idle() {
-        let (sender, requests) = mpsc::channel();
-        let (acknowledge, received) = mpsc::channel();
-        let idle = Arc::new(AtomicBool::new(false));
-        let ready = Arc::clone(&idle);
-        let task = thread::spawn(move || {
-            worker(
-                &requests,
-                None,
-                || {
-                    Ok(if ready.load(Ordering::SeqCst) {
-                        Decision::Fetch
-                    } else {
-                        Decision::Wait("Comin is busy")
-                    })
-                },
-                |receipts| {
-                    acknowledge
-                        .send(receipts.iter().map(|r| r.publish.pkid).collect::<Vec<_>>())
-                        .unwrap();
-                },
-            );
+        state.fetcher.as_mut().unwrap().is_fetching = None;
+        assert!(matches!(decision(&state), Decision::Wait(_)));
+        assert!(matches!(
+            decision(&comin::State::default()),
+            Decision::Wait(_)
+        ));
+        state.fetcher.as_mut().unwrap().is_fetching = Some(false);
+        state.builder.as_mut().unwrap().generation = Some(comin::Generation {
+            eval_status: "failed".into(),
+            ..Default::default()
         });
-        sender.send(request(1)).unwrap();
-        sender.send(request(1)).unwrap();
-        sender.send(request(2)).unwrap();
-        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
-        idle.store(true, Ordering::SeqCst);
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(3)).unwrap(),
-            vec![1, 2]
-        );
-        drop(sender);
-        task.join().unwrap();
-    }
-
-    #[test]
-    fn a_request_arriving_during_fetch_needs_a_subsequent_fetch() {
-        let (sender, requests) = mpsc::channel();
-        let (started, starting) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let (acknowledge, received) = mpsc::channel();
-        let task = thread::spawn(move || {
-            worker(
-                &requests,
-                None,
-                || {
-                    started.send(()).unwrap();
-                    released.recv().unwrap();
-                    Ok(Decision::Fetch)
-                },
-                |receipts| {
-                    acknowledge
-                        .send(receipts.iter().map(|r| r.publish.pkid).collect::<Vec<_>>())
-                        .unwrap();
-                },
-            );
-        });
-        sender.send(request(1)).unwrap();
-        starting.recv_timeout(Duration::from_secs(3)).unwrap();
-        sender.send(request(2)).unwrap();
-        release.send(()).unwrap();
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(3)).unwrap(),
-            vec![1]
-        );
-        starting.recv_timeout(Duration::from_secs(3)).unwrap();
-        release.send(()).unwrap();
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(3)).unwrap(),
-            vec![2]
-        );
-        drop(sender);
-        task.join().unwrap();
+        assert_eq!(decision(&state), Decision::RestartFailed);
     }
 }

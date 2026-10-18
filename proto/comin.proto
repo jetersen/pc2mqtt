@@ -1,0 +1,48 @@
+// Wire-compatible subset of Comin v0.14.0 pkg/protobuf/services.proto.
+// https://github.com/nlewo/comin/blob/v0.14.0/pkg/protobuf/services.proto
+// Preserve upstream field numbers. Unused fields/events are intentionally omitted.
+syntax = "proto3";
+package protobuf;
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+service Comin {
+  rpc GetState(google.protobuf.Empty) returns (State);
+  rpc Fetch(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc Events(google.protobuf.Empty) returns (stream Event);
+}
+message Event {
+  message ManagerState { State state = 1; }
+  message Fetched { RepositoryStatus repositoryStatus = 1; }
+  oneof Type {
+    ManagerState managerState = 13;
+    Fetched fetched = 14;
+  }
+  google.protobuf.Timestamp createdAt = 15;
+}
+message State {
+  google.protobuf.BoolValue is_suspended = 2;
+  Builder builder = 3;
+  Deployer deployer = 4;
+  Fetcher fetcher = 5;
+}
+message Builder {
+  google.protobuf.BoolValue is_evaluating = 1;
+  google.protobuf.BoolValue is_building = 2;
+  Generation generation = 3;
+  google.protobuf.BoolValue is_suspended = 5;
+}
+message Generation {
+  string eval_status = 13;
+  string build_status = 20;
+}
+message Deployer {
+  google.protobuf.BoolValue is_deploying = 1;
+  google.protobuf.BoolValue is_suspended = 5;
+}
+message Fetcher { google.protobuf.BoolValue is_fetching = 1; }
+message RepositoryStatus {
+  repeated Remote remotes = 12;
+  string error_msg = 13;
+}
+message Remote { string fetch_error_msg = 3; }
