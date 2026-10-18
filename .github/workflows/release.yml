@@ -18,6 +18,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
+      - name: Install musl C toolchain for TLS dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target "$TARGET"
       - name: Package
         run: |
