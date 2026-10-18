@@ -114,6 +114,12 @@ pub fn discovery(cfg: &crate::Config) -> Vec<(String, String)> {
             payload["payload_off"] = "False".into();
             payload["device_class"] = "problem".into();
         }
+        if key == "deployed_revision" {
+            payload["value_template"] = "{{ (value_json.deployed_revision or '')[:7] }}".into();
+            payload["json_attributes_topic"] = topic.clone().into();
+            payload["json_attributes_template"] =
+                "{{ {'deployed_revision': value_json.deployed_revision} | tojson }}".into();
+        }
         (format!("{}/{component}/{}/{n}_{key}/config", cfg.mqtt.auto_discovery_prefix, cfg.device_id), payload.to_string())
     }).collect()
 }
