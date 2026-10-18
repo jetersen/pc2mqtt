@@ -2,6 +2,7 @@ use std::process::Command;
 
 fn main() {
     let mut config = tonic_prost_build::Config::new();
+    config.boxed(".protobuf.Event.ManagerState.state");
     config.protoc_executable(
         std::env::var_os("PROTOC")
             .map(std::path::PathBuf::from)

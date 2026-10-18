@@ -1,6 +1,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod deployment;
 mod updates;
 
 use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS, Transport};
@@ -211,7 +212,7 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
         name: n,
     };
 
-    vec![
+    let mut payloads = vec![
         (
             topics.discovery_power.clone(),
             serde_json::to_string(&DiscoveryConfig {
@@ -263,7 +264,11 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
             })
             .unwrap(),
         ),
-    ]
+    ];
+    if cfg.updates {
+        payloads.extend(deployment::discovery(cfg));
+    }
+    payloads
 }
 
 fn systemctl(op: &str) {
@@ -314,9 +319,10 @@ fn main() {
     opts.set_manual_acks(cfg.updates);
 
     let (client, mut connection) = Client::new(opts, MQTT_QUEUE_CAPACITY);
-    let updates = cfg
-        .updates
-        .then(|| updates::Updates::start(client.clone()).expect("could not start update handler"));
+    let updates = cfg.updates.then(|| {
+        updates::Updates::start(client.clone(), &cfg.device_name)
+            .expect("could not start update handler")
+    });
     let discoveries = discovery_payloads(&cfg, &topics);
     let mut initial_connect_done = false;
     let mut acknowledgements = VecDeque::new();

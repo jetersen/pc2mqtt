@@ -1,4 +1,5 @@
-use rumqttc::{Client, Publish};
+use crate::deployment::Status;
+use rumqttc::{Client, Publish, QoS};
 use std::{
     collections::HashSet,
     fs, io,
@@ -184,11 +185,60 @@ async fn submit(
     }
 }
 
+// The worker may wait for outgoing capacity; the main MQTT loop never does so
+// on its behalf. Only enqueue while connected, and retain the latest snapshot
+// locally for replay on the next connection epoch.
+fn publish_status(
+    mqtt: &Client,
+    topic: &str,
+    status: &Status,
+    connection: &AtomicU64,
+    published: &mut Option<(u64, Status)>,
+) {
+    let epoch = connection.load(Ordering::SeqCst);
+    if epoch & 1 == 0
+        || published
+            .as_ref()
+            .is_some_and(|(previous_epoch, previous)| {
+                *previous_epoch == epoch && previous == status
+            })
+    {
+        return;
+    }
+    if mqtt
+        .publish(
+            topic,
+            QoS::AtLeastOnce,
+            true,
+            serde_json::to_vec(status).unwrap(),
+        )
+        .is_ok()
+    {
+        *published = Some((epoch, status.clone()));
+    }
+}
+
+async fn telemetry(
+    grpc: &mut Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)>,
+) -> Status {
+    if let Some((client, _)) = grpc {
+        match state(client).await {
+            Ok(snapshot) => return Status::from_state(&snapshot),
+            Err(error) => {
+                *grpc = None;
+                eprintln!("Comin telemetry unavailable: {error}");
+            }
+        }
+    }
+    Status::unavailable()
+}
+
 async fn worker(
     requests: Receiver<Request>,
     socket: UnixDatagram,
     mqtt: Client,
     connection: Arc<AtomicU64>,
+    status_topic: String,
 ) {
     socket
         .set_nonblocking(true)
@@ -200,6 +250,7 @@ async fn worker(
     let mut grpc: Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)> = None;
     let mut buffer = [0; 16];
     let mut previous = String::new();
+    let mut published = None;
     loop {
         let mut settle = false;
         let mut failed_fetch = false;
@@ -240,6 +291,8 @@ async fn worker(
                     settle = true;
                 } else {
                     pending.append(&mut inflight);
+                    let status = Status::unavailable();
+                    publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
                     grpc = connect().await.ok();
                     // If unavailable, the socket path watch wakes us when ready.
                     eprintln!("Comin disconnected; waiting for a lifecycle or MQTT event");
@@ -253,20 +306,31 @@ async fn worker(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         drain_requests(&requests, &socket, &mut pending);
-        if pending.is_empty() || !inflight.is_empty() || failed_fetch {
-            continue;
-        }
         if grpc.is_none() {
             match connect().await {
                 Ok(connected) => grpc = Some(connected),
                 Err(error) => {
-                    eprintln!("Update pending: Comin unavailable: {error}");
+                    let status = Status::unavailable();
+                    publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+                    eprintln!("Comin unavailable: {error}");
                     continue;
                 }
             }
         }
+        let mut status = telemetry(&mut grpc).await;
+        publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+        if pending.is_empty() || !inflight.is_empty() || failed_fetch || grpc.is_none() {
+            continue;
+        }
         let message = submit(&mut grpc, &mut pending, &mut inflight, &mut started).await;
+        if !inflight.is_empty() {
+            // Comin 0.14 emits Fetched but has no FetchStarted event.
+            status.state = "updating";
+            publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+        }
         if grpc.is_none() {
+            status = Status::unavailable();
+            publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
             // The socket may already have been replaced before the old channel
             // reports failure. Reconnect once for this event; never run a retry loop.
             grpc = connect().await.ok();
@@ -286,7 +350,8 @@ pub struct Updates {
 }
 
 impl Updates {
-    pub fn start(client: Client) -> io::Result<Self> {
+    pub fn start(client: Client, device_name: &str) -> io::Result<Self> {
+        let status_topic = format!("{device_name}/deployment/state");
         let path = socket_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -322,7 +387,13 @@ impl Updates {
                     .enable_all()
                     .build()
                     .expect("update runtime")
-                    .block_on(worker(receiver, socket, client, worker_connection));
+                    .block_on(worker(
+                        receiver,
+                        socket,
+                        client,
+                        worker_connection,
+                        status_topic,
+                    ));
             })?;
         let updates = Self {
             requests,
@@ -375,6 +446,7 @@ mod tests {
             is_suspended: Some(false),
             fetcher: Some(comin::Fetcher {
                 is_fetching: Some(false),
+                ..Default::default()
             }),
             builder: Some(comin::Builder {
                 is_evaluating: Some(false),
@@ -385,6 +457,7 @@ mod tests {
                 is_deploying: Some(false),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         assert_eq!(decision(&state), Decision::Fetch);
         for flag in 0..7 {

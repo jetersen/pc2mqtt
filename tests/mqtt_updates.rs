@@ -52,7 +52,7 @@ impl Comin for MockComin {
                 created_at: Some(SystemTime::now().into()),
                 r#type: Some(comin::event::Type::ManagerState(
                     comin::event::ManagerState {
-                        state: Some(initial_state),
+                        state: Some(Box::new(initial_state)),
                     },
                 )),
             }))
@@ -86,6 +86,7 @@ impl App {
                 is_suspended: Some(false),
                 fetcher: Some(comin::Fetcher {
                     is_fetching: Some(false),
+                    ..Default::default()
                 }),
                 builder: Some(comin::Builder {
                     is_evaluating: Some(false),
@@ -96,6 +97,7 @@ impl App {
                     is_deploying: Some(false),
                     ..Default::default()
                 }),
+                ..Default::default()
             })),
             fetches: Arc::new(AtomicUsize::new(0)),
             events: tokio::sync::broadcast::channel(64).0,
@@ -209,13 +211,17 @@ impl Drop for App {
     fn drop(&mut self) {
         self.child.kill().ok();
         self.child.wait().ok();
-        self.stop.take().unwrap().send(()).ok();
-        self.server.take().unwrap().join().unwrap();
+        if let Some(stop) = self.stop.take() {
+            stop.send(()).ok();
+        }
+        if let Some(server) = self.server.take() {
+            server.join().unwrap();
+        }
         fs::remove_dir_all(&self.directory).ok();
     }
 }
 
-struct Broker(TcpStream);
+struct Broker(TcpStream, Vec<(String, Vec<u8>, bool)>);
 
 impl Broker {
     fn accept(listener: &TcpListener, session_present: bool) -> Self {
@@ -231,7 +237,7 @@ impl Broker {
                 Err(error) => panic!("accept failed: {error}"),
             }
         };
-        let mut broker = Self(stream);
+        let mut broker = Self(stream, Vec::new());
         let (header, connect) = broker.read(Duration::from_secs(3)).unwrap();
         assert_eq!(header >> 4, 1);
         assert_eq!(
@@ -275,6 +281,15 @@ impl Broker {
     }
 
     fn respond(&mut self, header: u8, body: &[u8]) {
+        if header >> 4 == 3 {
+            let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+            let offset = 2 + length + if header & 6 == 0 { 0 } else { 2 };
+            self.1.push((
+                String::from_utf8(body[2..2 + length].to_vec()).unwrap(),
+                body[offset..].to_vec(),
+                header & 1 != 0,
+            ));
+        }
         match header >> 4 {
             3 if header & 6 == 2 => {
                 let topic_length = usize::from(u16::from_be_bytes([body[0], body[1]]));
@@ -297,6 +312,25 @@ impl Broker {
             }
         }
         panic!("update topic was not subscribed");
+    }
+
+    fn wait_for_status(&mut self, expected: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(index) = self.1.iter().position(|(topic, payload, _)| {
+                topic == "fixture/deployment/state"
+                    && serde_json::from_slice::<serde_json::Value>(payload).unwrap()["state"]
+                        == expected
+            }) {
+                let (_, payload, retained) = self.1.remove(index);
+                assert!(retained);
+                return serde_json::from_slice(&payload).unwrap();
+            }
+            assert!(Instant::now() < deadline, "no {expected} deployment status");
+            if let Some((header, body)) = self.read(Duration::from_millis(100)) {
+                self.respond(header, &body);
+            }
+        }
     }
 
     fn publish(&mut self, id: u16, retained: bool, duplicate: bool) {
@@ -442,4 +476,67 @@ fn update_acknowledgements_wait_for_comin_and_survive_reconnection() {
     app.wait_for_fetch(previous + 1);
     app.finish_fetch();
     assert!(broker.acknowledged(46, Duration::from_secs(3)));
+}
+
+#[test]
+fn deployment_discovery_tracks_idle_events_and_republishes_after_mqtt_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut app = App::start(listener.local_addr().unwrap().port());
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    broker.wait_for_status("updating");
+    {
+        let mut state = app.comin.state.lock().unwrap();
+        state.need_to_reboot = Some(true);
+        state.store = Some(comin::Store {
+            deployment_switched: "new".into(),
+            deployment_booted: "old".into(),
+            deployments: [("new", "deployed"), ("old", "booted")]
+                .into_iter()
+                .map(|(id, revision)| comin::Deployment {
+                    uuid: id.into(),
+                    generation: Some(comin::Generation {
+                        selected_commit_id: revision.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+        });
+    }
+    app.set_busy(false);
+    let status = broker.wait_for_status("idle");
+    assert_eq!(status["deployed_revision"], "deployed");
+    assert_eq!(status["booted_revision"], "booted");
+    assert_eq!(status["reboot_required"], true);
+    app.wait_for_fetch(1);
+    app.finish_fetch();
+    thread::sleep(Duration::from_millis(300));
+    app.comin.state.lock().unwrap().is_suspended = Some(true);
+    app.comin.events.send(comin::Event::default()).unwrap();
+    broker.wait_for_status("suspended");
+    let configs: Vec<_> = broker
+        .1
+        .iter()
+        .filter(|(topic, _, _)| topic.ends_with("/config"))
+        .collect();
+    assert_eq!(configs.len(), 6);
+    assert!(configs.iter().all(|(_, _, retained)| *retained));
+    drop(broker);
+    let mut broker = Broker::accept(&listener, true);
+    broker.wait_for_subscription();
+    broker.wait_for_status("suspended");
+    {
+        let mut state = app.comin.state.lock().unwrap();
+        state.is_suspended = Some(false);
+        state.deployer.as_mut().unwrap().deployment = Some(comin::Deployment {
+            status: "failed".into(),
+            ..Default::default()
+        });
+    }
+    app.comin.events.send(comin::Event::default()).unwrap();
+    broker.wait_for_status("failed");
+    app.stop.take().unwrap().send(()).unwrap();
+    app.server.take().unwrap().join().unwrap();
+    broker.wait_for_status("unavailable");
 }

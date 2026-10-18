@@ -7,6 +7,7 @@ Control your PC or homeserver from Home Assistant through MQTT.
 - Power sensor
 - Shutdown button
 - Reboot button
+- Comin deployment status, deployed revision, and reboot-required sensor (when updates are enabled)
 
 ![homeassistant](.github/images/homeassistant.png)
 
@@ -82,6 +83,17 @@ for another lifecycle, MQTT, or Comin event; there is no periodic retry. The ser
 needs access to Comin's socket and `systemctl` on `PATH` solely to restart an active
 daemon after a settled generation failure (Comin 0.14 has no retry-generation RPC).
 Leave updates disabled on hosts without Comin. Restrict command publishers with broker ACLs.
+
+When updates are enabled, Home Assistant discovers three diagnostic entities on the
+existing device. Retained JSON on `<device_name>/deployment/state` contains
+`state` (`idle`, `updating`, `suspended`, `failed`, or `unavailable`),
+`deployed_revision`, `booted_revision`, and `reboot_required`. Revisions refer to
+Comin's actual switched and booted deployments, not the pending build. Unknown
+revisions or reboot requirements are `null`. The existing Comin event stream
+refreshes this snapshot without polling, and MQTT reconnects republish it. Host
+availability uses the existing last will; Comin disconnections mark deployment
+telemetry unavailable. Allow the state topic and the three discovery topics in
+broker ACLs alongside the existing power entities.
 
 ## Build
 
