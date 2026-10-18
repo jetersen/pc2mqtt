@@ -1,9 +1,11 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod updates;
+
 use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
-use std::{io, path::PathBuf, process::Command, time::Duration};
+use std::{collections::VecDeque, io, path::PathBuf, process::Command, time::Duration};
 use uuid::Uuid;
 
 const GIT_SHA: &str = env!("GIT_SHA");
@@ -280,20 +282,16 @@ fn accepts_command(retained: bool, payload: &[u8]) -> bool {
     !retained && payload == b"PRESS"
 }
 
-fn update() {
-    match Command::new("systemctl")
-        .args(["--no-block", "start", "comin-fetch.service"])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("Update request failed: {status}"),
-        Err(error) => eprintln!("Failed to request update: {error}"),
-    }
-}
-
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("pc2mqtt {GIT_SHA}");
+        return;
+    }
+    if std::env::args().any(|argument| argument == "--request-update") {
+        if let Err(error) = updates::request_local_update() {
+            eprintln!("Could not queue update: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -311,19 +309,26 @@ fn main() {
         QoS::AtLeastOnce,
         true,
     ));
-    opts.set_clean_session(true);
+    // Keep unhandled QoS 1 update commands available across reconnections.
+    opts.set_clean_session(!cfg.updates);
+    opts.set_manual_acks(cfg.updates);
 
     let (client, mut connection) = Client::new(opts, MQTT_QUEUE_CAPACITY);
+    let updates = cfg
+        .updates
+        .then(|| updates::Updates::start(client.clone()).expect("could not start update handler"));
     let discoveries = discovery_payloads(&cfg, &topics);
     let mut initial_connect_done = false;
+    let mut acknowledgements = VecDeque::new();
 
     for event in connection.iter() {
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                acknowledgements.clear();
                 println!("Connected to MQTT broker");
-                if cfg.updates {
+                if let Some(updates) = &updates {
                     client.subscribe(&topics.cmd_update, QoS::AtLeastOnce).ok();
-                    update();
+                    updates.connected();
                 }
 
                 if !initial_connect_done {
@@ -348,16 +353,42 @@ fn main() {
 
                 println!("Ready to receive commands");
             }
-            Ok(Event::Incoming(Packet::Publish(p))) if accepts_command(p.retain, &p.payload) => {
-                match p.topic.as_str() {
-                    t if t == topics.cmd_shutdown => systemctl("poweroff"),
-                    t if t == topics.cmd_reboot => systemctl("reboot"),
-                    t if cfg.updates && t == topics.cmd_update => update(),
-                    _ => {}
+            Ok(Event::Incoming(Packet::Publish(p))) => {
+                let accepted = accepts_command(p.retain, &p.payload);
+                if let Some(updates) = &updates
+                    && accepted
+                    && p.topic == topics.cmd_update
+                {
+                    updates.request(p);
+                } else {
+                    if accepted {
+                        match p.topic.as_str() {
+                            t if t == topics.cmd_shutdown => systemctl("poweroff"),
+                            t if t == topics.cmd_reboot => systemctl("reboot"),
+                            _ => {}
+                        }
+                    }
+                    // Keep rejected and unrelated commands moving even when a burst
+                    // of completed updates fills the MQTT outgoing request channel.
+                    if updates.is_some() {
+                        acknowledgements.push_back(p);
+                    }
                 }
             }
-            Err(e) => eprintln!("Connection error: {e} — retrying..."),
+            Err(e) => {
+                if let Some(updates) = &updates {
+                    updates.disconnected();
+                }
+                acknowledgements.clear();
+                eprintln!("Connection error: {e} — retrying...");
+            }
             _ => {}
+        }
+        while let Some(publish) = acknowledgements.front() {
+            if client.try_ack(publish).is_err() {
+                break;
+            }
+            acknowledgements.pop_front();
         }
     }
 }

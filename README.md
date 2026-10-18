@@ -26,6 +26,8 @@ After=network-online.target
 [Service]
 ExecStart=/opt/pc2mqtt/pc2mqtt
 Restart=always
+RuntimeDirectory=pc2mqtt
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
@@ -57,10 +59,24 @@ Publish commands without retention; MQTT can forward a newly retained publicatio
 to an existing subscriber without marking it as retained.
 
 On NixOS hosts, set top-level `"updates": true` to enable
-`<device_name>/button/update/command`. This starts the fixed
-`comin-fetch.service` unit, and also requests an update on every broker connection.
-The service account needs permission to start that unit. Leave this disabled on
-hosts without Comin. Use broker ACLs to restrict publishers to the required topics.
+`<device_name>/button/update/command`. pc2mqtt requests a Comin fetch immediately
+when the daemon is active, unsuspended, and idle. Pending requests check readiness
+once per second. One shared update worker blocks when idle; requests do not spawn
+additional workers. A stopped or suspended Comin
+stays that way until explicitly started or resumed. A settled failed generation
+causes an active Comin daemon to restart before fetching the unchanged commit.
+
+QoS 1 update commands are acknowledged after Comin successfully fetches. Persistent
+MQTT sessions allow unacknowledged commands to be redelivered after reconnecting.
+Startup and broker connections also request a fetch, covering missed notifications.
+Retained command replays remain ignored.
+
+`pc2mqtt --request-update` queues a local request through
+`/run/pc2mqtt/update.sock`, or `PC2MQTT_UPDATE_SOCKET` if set. The socket permits
+access only to the service account. Use this for manual checks and resume/network
+hooks. The service needs `comin`, `systemctl`, and `timeout` on `PATH`, with permission
+to query/fetch Comin and restart its active service after a failure. Leave updates
+disabled on hosts without Comin. Restrict command publishers with broker ACLs.
 
 ## Build
 
