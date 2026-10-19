@@ -10,6 +10,21 @@ pub struct Status {
     pub reboot_required: Option<bool>,
 }
 
+pub fn fetch_failed(status: &comin::RepositoryStatus) -> bool {
+    !status.error_msg.is_empty()
+        || status.remotes.iter().any(|remote| {
+            !remote.fetch_error_msg.is_empty()
+                || remote
+                    .main
+                    .as_ref()
+                    .is_some_and(|branch| !branch.error_msg.is_empty())
+                || remote
+                    .testing
+                    .as_ref()
+                    .is_some_and(|branch| !branch.error_msg.is_empty())
+        })
+}
+
 impl Status {
     pub fn unavailable() -> Self {
         Self {
@@ -52,12 +67,7 @@ impl Status {
                 .deployment
                 .as_ref()
                 .is_some_and(|d| d.status == "failed")
-            || fetcher.repository_status.as_ref().is_some_and(|r| {
-                !r.error_msg.is_empty()
-                    || r.remotes
-                        .iter()
-                        .any(|remote| !remote.fetch_error_msg.is_empty())
-            })
+            || fetcher.repository_status.as_ref().is_some_and(fetch_failed)
         {
             "failed"
         } else {

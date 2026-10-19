@@ -1,4 +1,4 @@
-use crate::deployment::Status;
+use crate::deployment::{Status, fetch_failed};
 use rumqttc::{Client, Publish, QoS};
 use std::{
     collections::HashSet,
@@ -315,8 +315,7 @@ impl Batch {
             return false;
         }
         if let Some(status) = &fetched.repository_status
-            && status.error_msg.is_empty()
-            && status.remotes.iter().all(|r| r.fetch_error_msg.is_empty())
+            && !fetch_failed(status)
         {
             if self.fetched_commit.as_deref() != Some(&status.selected_commit_id) {
                 self.fetched_commit = Some(status.selected_commit_id.clone());

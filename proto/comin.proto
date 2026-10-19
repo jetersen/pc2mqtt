@@ -67,4 +67,9 @@ message RepositoryStatus {
   repeated Remote remotes = 12;
   string error_msg = 13;
 }
-message Remote { string fetch_error_msg = 3; }
+message Branch { string error_msg = 4; }
+message Remote {
+  string fetch_error_msg = 3;
+  Branch main = 4;
+  Branch testing = 5;
+}

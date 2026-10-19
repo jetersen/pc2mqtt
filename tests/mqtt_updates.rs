@@ -727,3 +727,55 @@ fn a_new_commit_waits_for_its_build_instead_of_resubmitting_an_old_deployment() 
     app.comin.events.send(comin::Event::default()).unwrap();
     assert!(broker.acknowledged(61, Duration::from_secs(3)));
 }
+
+#[test]
+fn rejected_branch_history_keeps_the_update_queued_until_a_successful_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start(listener.local_addr().unwrap().port());
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    broker.publish(62, false, false);
+    app.set_busy(false);
+    app.wait_for_fetch(1);
+    app.comin
+        .state
+        .lock()
+        .unwrap()
+        .fetcher
+        .as_mut()
+        .unwrap()
+        .repository_status
+        .as_mut()
+        .unwrap()
+        .remotes
+        .push(comin::Remote {
+            main: Some(comin::Branch {
+                error_msg: "this branch has been hard reset".into(),
+            }),
+            ..Default::default()
+        });
+    app.finish_fetch();
+    assert!(!broker.acknowledged(62, Duration::from_millis(400)));
+    broker.wait_for_status("failed");
+    assert_eq!(
+        app.fetches(),
+        1,
+        "a rejected branch must wait for another event"
+    );
+    app.comin
+        .state
+        .lock()
+        .unwrap()
+        .fetcher
+        .as_mut()
+        .unwrap()
+        .repository_status
+        .as_mut()
+        .unwrap()
+        .remotes
+        .clear();
+    app.comin.events.send(comin::Event::default()).unwrap();
+    app.wait_for_fetch(2);
+    app.finish_fetch();
+    assert!(broker.acknowledged(62, Duration::from_secs(3)));
+}

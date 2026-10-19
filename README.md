@@ -79,7 +79,9 @@ build rather than resubmitting an older deployment. Deployment telemetry stays
 
 Persistent MQTT sessions allow unacknowledged commands to be redelivered after
 reconnecting. Startup and broker connections also request an update, covering
-missed notifications. Retained command replays remain ignored.
+missed notifications. Branch-selection errors, including rejected rewritten history,
+keep requests queued and report failure even when the Git transport succeeds.
+Retained command replays remain ignored.
 
 `pc2mqtt --request-update` queues a local request through
 `/run/pc2mqtt/update.sock`, or `PC2MQTT_UPDATE_SOCKET` if set. The socket permits
