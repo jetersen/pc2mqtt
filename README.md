@@ -69,10 +69,17 @@ before clearing its busy flags. Requests do not spawn additional workers. A stop
 or suspended Comin stays that way until explicitly started or resumed. A settled failed generation
 causes an active Comin daemon to restart before fetching the unchanged commit.
 
-QoS 1 update commands are acknowledged after Comin successfully fetches. Persistent
-MQTT sessions allow unacknowledged commands to be redelivered after reconnecting.
-Startup and broker connections also request a fetch, covering missed notifications.
-Retained command replays remain ignored.
+QoS 1 update commands remain queued after fetching until the selected generation
+is active, or Comin has staged a boot-only deployment. If an older generation is
+running but Comin remembers deploying the selected commit, the worker resubmits
+that deployment through gRPC. It preserves the deployment operation and never
+bypasses suspension or reboot-only inhibitors. A new commit waits for its own
+build rather than resubmitting an older deployment. Deployment telemetry stays
+`updating` while a request is pending, unless Comin reports failure or suspension.
+
+Persistent MQTT sessions allow unacknowledged commands to be redelivered after
+reconnecting. Startup and broker connections also request an update, covering
+missed notifications. Retained command replays remain ignored.
 
 `pc2mqtt --request-update` queues a local request through
 `/run/pc2mqtt/update.sock`, or `PC2MQTT_UPDATE_SOCKET` if set. The socket permits

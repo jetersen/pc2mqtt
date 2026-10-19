@@ -10,7 +10,9 @@ service Comin {
   rpc GetState(google.protobuf.Empty) returns (State);
   rpc Fetch(google.protobuf.Empty) returns (google.protobuf.Empty);
   rpc Events(google.protobuf.Empty) returns (stream Event);
+  rpc DeploymentLatestSubmit(Operation) returns (google.protobuf.Empty);
 }
+message Operation { string operation_submitted = 1; }
 message Event {
   message ManagerState { State state = 1; }
   message Fetched { RepositoryStatus repositoryStatus = 1; }
@@ -38,6 +40,7 @@ message Generation {
   string selected_commit_id = 7;
   string eval_status = 13;
   string build_status = 20;
+  string out_path = 17;
 }
 message Deployer {
   google.protobuf.BoolValue is_deploying = 1;
@@ -52,6 +55,7 @@ message Deployment {
   string uuid = 1;
   Generation generation = 2;
   string status = 8;
+  string operation = 9;
 }
 message Store {
   repeated Deployment deployments = 1;
@@ -59,6 +63,7 @@ message Store {
   string deployment_booted = 4;
 }
 message RepositoryStatus {
+  string selected_commit_id = 1;
   repeated Remote remotes = 12;
   string error_msg = 13;
 }

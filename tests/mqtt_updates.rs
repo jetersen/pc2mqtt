@@ -24,6 +24,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 struct MockComin {
     state: Arc<Mutex<comin::State>>,
     fetches: Arc<AtomicUsize>,
+    deployments: Arc<AtomicUsize>,
     events: tokio::sync::broadcast::Sender<comin::Event>,
 }
 
@@ -37,6 +38,22 @@ impl Comin for MockComin {
     }
     async fn fetch(&self, _: tonic::Request<()>) -> Result<tonic::Response<()>, tonic::Status> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
+        Ok(tonic::Response::new(()))
+    }
+    async fn deployment_latest_submit(
+        &self,
+        request: tonic::Request<comin::Operation>,
+    ) -> Result<tonic::Response<()>, tonic::Status> {
+        assert_eq!(request.into_inner().operation_submitted, "switch");
+        self.state
+            .lock()
+            .unwrap()
+            .deployer
+            .as_mut()
+            .unwrap()
+            .is_deploying = Some(true);
+        self.deployments.fetch_add(1, Ordering::SeqCst);
+        self.events.send(comin::Event::default()).ok();
         Ok(tonic::Response::new(()))
     }
     type EventsStream = ReceiverStream<Result<comin::Event, tonic::Status>>;
@@ -86,20 +103,53 @@ impl App {
                 is_suspended: Some(false),
                 fetcher: Some(comin::Fetcher {
                     is_fetching: Some(false),
-                    ..Default::default()
+                    repository_status: Some(comin::RepositoryStatus {
+                        selected_commit_id: "target".into(),
+                        ..Default::default()
+                    }),
                 }),
                 builder: Some(comin::Builder {
                     is_evaluating: Some(false),
                     is_building: Some(true),
+                    generation: Some(comin::Generation {
+                        selected_commit_id: "target".into(),
+                        build_status: "built".into(),
+                        out_path: "/nix/store/target".into(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 deployer: Some(comin::Deployer {
                     is_deploying: Some(false),
+                    deployment: Some(comin::Deployment {
+                        uuid: "target".into(),
+                        status: "done".into(),
+                        operation: "switch".into(),
+                        generation: Some(comin::Generation {
+                            selected_commit_id: "target".into(),
+                            out_path: "/nix/store/target".into(),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                store: Some(comin::Store {
+                    deployment_switched: "target".into(),
+                    deployments: vec![comin::Deployment {
+                        uuid: "target".into(),
+                        generation: Some(comin::Generation {
+                            selected_commit_id: "target".into(),
+                            out_path: "/nix/store/target".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 }),
                 ..Default::default()
             })),
             fetches: Arc::new(AtomicUsize::new(0)),
+            deployments: Arc::new(AtomicUsize::new(0)),
             events: tokio::sync::broadcast::channel(64).0,
         };
         let (stop, server) = Self::start_server(directory.join("comin.sock"), comin.clone());
@@ -188,7 +238,16 @@ impl App {
             .send(comin::Event {
                 created_at: Some(SystemTime::now().into()),
                 r#type: Some(comin::event::Type::Fetched(comin::event::Fetched {
-                    repository_status: Some(comin::RepositoryStatus::default()),
+                    repository_status: self
+                        .comin
+                        .state
+                        .lock()
+                        .unwrap()
+                        .fetcher
+                        .as_ref()
+                        .unwrap()
+                        .repository_status
+                        .clone(),
                 })),
             })
             .unwrap();
@@ -497,6 +556,12 @@ fn deployment_discovery_tracks_idle_events_and_republishes_after_mqtt_reconnect(
                     uuid: id.into(),
                     generation: Some(comin::Generation {
                         selected_commit_id: revision.into(),
+                        out_path: if id == "new" {
+                            "/nix/store/target"
+                        } else {
+                            "/nix/store/old"
+                        }
+                        .into(),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -505,7 +570,8 @@ fn deployment_discovery_tracks_idle_events_and_republishes_after_mqtt_reconnect(
         });
     }
     app.set_busy(false);
-    let status = broker.wait_for_status("idle");
+    let status = broker.wait_for_status("updating");
+    // The fetch request is still pending even though Comin is momentarily idle.
     assert_eq!(status["deployed_revision"], "deployed");
     assert_eq!(status["booted_revision"], "booted");
     assert_eq!(status["reboot_required"], true);
@@ -539,4 +605,125 @@ fn deployment_discovery_tracks_idle_events_and_republishes_after_mqtt_reconnect(
     app.stop.take().unwrap().send(()).unwrap();
     app.server.take().unwrap().join().unwrap();
     broker.wait_for_status("unavailable");
+}
+
+#[test]
+fn reconnect_restores_the_fetched_generation_before_acknowledging_updates() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start(listener.local_addr().unwrap().port());
+    {
+        let mut state = app.comin.state.lock().unwrap();
+        let store = state.store.as_mut().unwrap();
+        store.deployment_switched = "old-boot".into();
+        store.deployments.push(comin::Deployment {
+            uuid: "old-boot".into(),
+            generation: Some(comin::Generation {
+                out_path: "/nix/store/old-boot".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    broker.publish(60, false, false);
+    app.set_busy(false);
+    app.wait_for_fetch(1);
+    app.finish_fetch();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while app.comin.deployments.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "older boot was not reconciled");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !broker.acknowledged(60, Duration::from_millis(300)),
+        "fetch/submit is not convergence"
+    );
+    for _ in 0..3 {
+        app.comin.events.send(comin::Event::default()).unwrap();
+    }
+    assert!(!broker.acknowledged(60, Duration::from_millis(300)));
+    assert_eq!(app.comin.deployments.load(Ordering::SeqCst), 1);
+    // An MQTT reconnect replays the unacknowledged request, never loses it.
+    drop(broker);
+    let mut broker = Broker::accept(&listener, true);
+    broker.wait_for_subscription();
+    broker.publish(60, false, true);
+    assert!(!broker.acknowledged(60, Duration::from_millis(200)));
+    {
+        let mut state = app.comin.state.lock().unwrap();
+        state.store.as_mut().unwrap().deployment_switched = "target".into();
+        state.deployer.as_mut().unwrap().is_deploying = Some(false);
+    }
+    app.comin.events.send(comin::Event::default()).unwrap();
+    // The replay belongs to the next request batch, which fetches again.
+    app.wait_for_fetch(2);
+    app.finish_fetch();
+    assert!(broker.acknowledged(60, Duration::from_secs(3)));
+    assert_eq!(app.comin.deployments.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_new_commit_waits_for_its_build_instead_of_resubmitting_an_old_deployment() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start(listener.local_addr().unwrap().port());
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    broker.publish(61, false, false);
+    app.comin
+        .state
+        .lock()
+        .unwrap()
+        .fetcher
+        .as_mut()
+        .unwrap()
+        .repository_status
+        .as_mut()
+        .unwrap()
+        .selected_commit_id = "new-target".into();
+    app.set_busy(false);
+    app.wait_for_fetch(1);
+    app.finish_fetch();
+    assert!(!broker.acknowledged(61, Duration::from_millis(300)));
+    assert_eq!(app.comin.deployments.load(Ordering::SeqCst), 0);
+    // Another successful fetch during deployment supersedes this batch's target.
+    app.comin
+        .state
+        .lock()
+        .unwrap()
+        .fetcher
+        .as_mut()
+        .unwrap()
+        .repository_status
+        .as_mut()
+        .unwrap()
+        .selected_commit_id = "newer-target".into();
+    app.finish_fetch();
+    {
+        let mut state = app.comin.state.lock().unwrap();
+        state
+            .builder
+            .as_mut()
+            .unwrap()
+            .generation
+            .as_mut()
+            .unwrap()
+            .selected_commit_id = "new-target".into();
+    }
+    app.comin.events.send(comin::Event::default()).unwrap();
+    assert!(!broker.acknowledged(61, Duration::from_millis(300)));
+    {
+        let mut state = app.comin.state.lock().unwrap();
+        state
+            .builder
+            .as_mut()
+            .unwrap()
+            .generation
+            .as_mut()
+            .unwrap()
+            .selected_commit_id = "newer-target".into();
+        // An unchanged system derivation needs no redeployment.
+    }
+    app.comin.events.send(comin::Event::default()).unwrap();
+    assert!(broker.acknowledged(61, Duration::from_secs(3)));
 }

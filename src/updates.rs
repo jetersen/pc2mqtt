@@ -71,6 +71,60 @@ fn decision(state: &comin::State) -> Decision {
     Decision::Fetch
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Reconciliation<'a> {
+    Wait,
+    Restore(&'a str),
+    Complete,
+}
+
+// A successful fetch only identifies the target. Comin 0.14 can remember a
+// successful deployment while an older system is running, and ignores unchanged
+// commits. Resubmit only that fetched target, never a stale previous deployment.
+fn reconciliation<'a>(state: &'a comin::State, target: &str) -> Reconciliation<'a> {
+    if target.is_empty() || decision(state) != Decision::Fetch {
+        return Reconciliation::Wait;
+    }
+    let Some(store) = &state.store else {
+        return Reconciliation::Wait;
+    };
+    let latest = state.deployer.as_ref().and_then(|d| d.deployment.as_ref());
+    let deployed_target = latest.filter(|d| {
+        d.status == "done"
+            && d.generation
+                .as_ref()
+                .is_some_and(|g| g.selected_commit_id == target)
+    });
+    let desired = state
+        .builder
+        .as_ref()
+        .and_then(|b| b.generation.as_ref())
+        .filter(|g| g.selected_commit_id == target && g.build_status == "built")
+        .or_else(|| deployed_target.and_then(|d| d.generation.as_ref()));
+    let Some(desired) = desired.filter(|g| !g.out_path.is_empty()) else {
+        return Reconciliation::Wait;
+    };
+    if store.deployments.iter().any(|d| {
+        !store.deployment_switched.is_empty()
+            && d.uuid == store.deployment_switched
+            && d.generation
+                .as_ref()
+                .is_some_and(|g| g.out_path == desired.out_path)
+    }) {
+        return Reconciliation::Complete;
+    }
+    if let Some(deployment) = deployed_target {
+        match deployment.operation.as_str() {
+            // A boot-only deployment has already staged the update. Preserve
+            // Comin's inhibitors rather than forcing it into the running session.
+            "boot" => return Reconciliation::Complete,
+            "switch" | "test" => return Reconciliation::Restore(&deployment.operation),
+            _ => {}
+        }
+    }
+    Reconciliation::Wait
+}
+
 async fn connect() -> Result<(CominClient<Channel>, tonic::Streaming<comin::Event>), String> {
     let path = std::env::var_os("PC2MQTT_COMIN_SOCKET")
         .map_or_else(|| PathBuf::from("/var/lib/comin/grpc.sock"), PathBuf::from);
@@ -218,19 +272,122 @@ fn publish_status(
     }
 }
 
-async fn telemetry(
+async fn snapshot(
     grpc: &mut Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)>,
-) -> Status {
+) -> Option<comin::State> {
     if let Some((client, _)) = grpc {
         match state(client).await {
-            Ok(snapshot) => return Status::from_state(&snapshot),
+            Ok(snapshot) => return Some(snapshot),
             Err(error) => {
                 *grpc = None;
                 eprintln!("Comin telemetry unavailable: {error}");
             }
         }
     }
-    Status::unavailable()
+    None
+}
+
+#[derive(Default)]
+struct Batch {
+    requests: Vec<Request>,
+    fetched_commit: Option<String>,
+    restore_submitted: bool,
+    started: prost_types::Timestamp,
+}
+
+impl Batch {
+    fn requeue(&mut self, pending: &mut Vec<Request>) {
+        pending.append(&mut self.requests);
+        self.fetched_commit = None;
+    }
+
+    fn fetched(&mut self, event: &comin::Event, pending: &mut Vec<Request>) -> bool {
+        // Ignore buffered completions from earlier fetches. A newer successful
+        // fetch supersedes the target if another update arrives during deployment.
+        let Some(comin::event::Type::Fetched(fetched)) = &event.r#type else {
+            return false;
+        };
+        if self.requests.is_empty()
+            || !event.created_at.is_some_and(|time| {
+                (time.seconds, time.nanos) >= (self.started.seconds, self.started.nanos)
+            })
+        {
+            return false;
+        }
+        if let Some(status) = &fetched.repository_status
+            && status.error_msg.is_empty()
+            && status.remotes.iter().all(|r| r.fetch_error_msg.is_empty())
+        {
+            if self.fetched_commit.as_deref() != Some(&status.selected_commit_id) {
+                self.fetched_commit = Some(status.selected_commit_id.clone());
+                self.restore_submitted = false;
+            }
+            eprintln!("Comin fetched remotes; waiting for deployment convergence");
+            false
+        } else {
+            self.requeue(pending);
+            eprintln!("Update pending: Comin fetch failed; waiting for an event");
+            true
+        }
+    }
+
+    async fn reconcile(
+        &mut self,
+        grpc: &mut Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)>,
+        snapshot: Option<&comin::State>,
+        pending: &mut Vec<Request>,
+        mqtt: &Client,
+        connection: &AtomicU64,
+    ) -> bool {
+        if let (Some(snapshot), Some(target)) = (snapshot, &self.fetched_commit) {
+            match reconciliation(snapshot, target) {
+                Reconciliation::Complete => {
+                    acknowledge(std::mem::take(&mut self.requests), mqtt, connection);
+                    self.fetched_commit = None;
+                    eprintln!("Comin update converged; update request handled");
+                }
+                Reconciliation::Restore(operation) if !self.restore_submitted => {
+                    let mut request = tonic::Request::new(comin::Operation {
+                        operation_submitted: operation.into(),
+                    });
+                    request.set_timeout(Duration::from_secs(10));
+                    match grpc
+                        .as_mut()
+                        .unwrap()
+                        .0
+                        .deployment_latest_submit(request)
+                        .await
+                    {
+                        Ok(_) => {
+                            self.restore_submitted = true;
+                            eprintln!(
+                                "Comin running system differs from fetched target; redeployment submitted"
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("Update pending: Comin redeployment failed: {error}");
+                            *grpc = None;
+                            pending.append(&mut self.requests);
+                            self.fetched_commit = None;
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if snapshot.is_none()
+            || (!self.requests.is_empty()
+                && snapshot.is_some_and(|s| decision(s) == Decision::RestartFailed))
+        {
+            // Keep failed requests for the next lifecycle event rather than
+            // retrying a settled failure in a tight loop.
+            pending.append(&mut self.requests);
+            self.fetched_commit = None;
+            return true;
+        }
+        false
+    }
 }
 
 async fn worker(
@@ -245,8 +402,7 @@ async fn worker(
         .expect("nonblocking update socket");
     let socket = tokio::net::UnixDatagram::from_std(socket).expect("async update socket");
     let mut pending = Vec::new();
-    let mut inflight = Vec::new();
-    let mut started = prost_types::Timestamp::from(SystemTime::UNIX_EPOCH);
+    let mut batch = Batch::default();
     let mut grpc: Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)> = None;
     let mut buffer = [0; 16];
     let mut previous = String::new();
@@ -269,28 +425,10 @@ async fn worker(
                 }
             } => {
                 if let Ok(Some(event)) = event {
-                    // A previous fetch's event can still be buffered when a new
-                    // request is submitted. Only accept completion after submission.
-                    if let Some(comin::event::Type::Fetched(fetched)) = event.r#type
-                        && event.created_at.is_some_and(|time|
-                            (time.seconds, time.nanos) >= (started.seconds, started.nanos))
-                    {
-                        let success = fetched.repository_status.as_ref().is_some_and(|status|
-                            status.error_msg.is_empty() && status.remotes.iter().all(|r| r.fetch_error_msg.is_empty()));
-                        if success {
-                            if !inflight.is_empty() {
-                                acknowledge(std::mem::take(&mut inflight), &mqtt, &connection);
-                                eprintln!("Comin fetched remotes; update request handled");
-                            }
-                        } else {
-                            pending.append(&mut inflight);
-                            failed_fetch = true;
-                            eprintln!("Update pending: Comin fetch failed; waiting for an event");
-                        }
-                    }
+                    failed_fetch = batch.fetched(&event, &mut pending);
                     settle = true;
                 } else {
-                    pending.append(&mut inflight);
+                    batch.requeue(&mut pending);
                     let status = Status::unavailable();
                     publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
                     grpc = connect().await.ok();
@@ -317,13 +455,36 @@ async fn worker(
                 }
             }
         }
-        let mut status = telemetry(&mut grpc).await;
+        let snapshot = snapshot(&mut grpc).await;
+        let mut status = snapshot
+            .as_ref()
+            .map_or_else(Status::unavailable, Status::from_state);
+        failed_fetch |= batch
+            .reconcile(
+                &mut grpc,
+                snapshot.as_ref(),
+                &mut pending,
+                &mqtt,
+                &connection,
+            )
+            .await;
+        // Fetch completion is not deployment completion. Keep both the request
+        // and the updating status until the selected system is active or staged.
+        if (!pending.is_empty() || !batch.requests.is_empty()) && status.state == "idle" {
+            status.state = "updating";
+        }
         publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
-        if pending.is_empty() || !inflight.is_empty() || failed_fetch || grpc.is_none() {
+        if pending.is_empty() || !batch.requests.is_empty() || failed_fetch || grpc.is_none() {
             continue;
         }
-        let message = submit(&mut grpc, &mut pending, &mut inflight, &mut started).await;
-        if !inflight.is_empty() {
+        let message = submit(
+            &mut grpc,
+            &mut pending,
+            &mut batch.requests,
+            &mut batch.started,
+        )
+        .await;
+        if !batch.requests.is_empty() {
             // Comin 0.14 emits Fetched but has no FetchStarted event.
             status.state = "updating";
             publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
@@ -439,6 +600,73 @@ impl Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_preserves_suspension_boot_operations_and_unknown_state() {
+        let generation = comin::Generation {
+            selected_commit_id: "target".into(),
+            out_path: "/target".into(),
+            build_status: "built".into(),
+            ..Default::default()
+        };
+        let mut state = comin::State {
+            is_suspended: Some(false),
+            fetcher: Some(comin::Fetcher {
+                is_fetching: Some(false),
+                ..Default::default()
+            }),
+            builder: Some(comin::Builder {
+                is_evaluating: Some(false),
+                is_building: Some(false),
+                generation: Some(generation.clone()),
+                ..Default::default()
+            }),
+            deployer: Some(comin::Deployer {
+                is_deploying: Some(false),
+                deployment: Some(comin::Deployment {
+                    status: "done".into(),
+                    operation: "switch".into(),
+                    generation: Some(generation),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            store: Some(comin::Store::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            reconciliation(&state, "target"),
+            Reconciliation::Restore("switch")
+        );
+        assert_eq!(reconciliation(&state, "other"), Reconciliation::Wait);
+        assert_eq!(reconciliation(&state, ""), Reconciliation::Wait);
+        state.is_suspended = Some(true);
+        assert_eq!(reconciliation(&state, "target"), Reconciliation::Wait);
+        state.is_suspended = Some(false);
+        state.deployer.as_mut().unwrap().is_suspended = Some(true);
+        assert_eq!(reconciliation(&state, "target"), Reconciliation::Wait);
+        state.deployer.as_mut().unwrap().is_suspended = Some(false);
+        state
+            .deployer
+            .as_mut()
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .operation = "boot".into();
+        assert_eq!(reconciliation(&state, "target"), Reconciliation::Complete);
+        state
+            .deployer
+            .as_mut()
+            .unwrap()
+            .deployment
+            .as_mut()
+            .unwrap()
+            .status = "failed".into();
+        assert_eq!(reconciliation(&state, "target"), Reconciliation::Wait);
+        state.store = None;
+        assert_eq!(reconciliation(&state, "target"), Reconciliation::Wait);
+    }
 
     #[test]
     fn only_complete_idle_unsuspended_state_allows_fetch() {
