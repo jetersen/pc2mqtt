@@ -1,0 +1,25 @@
+name: Build and Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: build-${{ forgejo.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: linux-docker
+    timeout-minutes: 15
+    steps:
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ forgejo.event.pull_request.head.sha || forgejo.sha }}
+          persist-credentials: false
+      - uses: https://github.com/dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-gnu
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+      - run: cargo test --locked --target x86_64-unknown-linux-gnu
