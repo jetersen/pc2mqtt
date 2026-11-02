@@ -839,7 +839,11 @@ fn audio_caps_are_correlated_and_unmute_is_confirmed() {
     let directory = std::env::temp_dir().join(format!("pc2mqtt-audio-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&directory).unwrap();
     let program = directory.join("adapter");
-    fs::write(&program, "#!/bin/sh\ncase \"$1\" in\nread) echo 'Volume: 0.75 [MUTED]' ;;\nlimit-unmute) test \"$2\" = 50 && echo 'Volume: 0.30' ;;\nlimit) echo 'Volume: 0.40 [MUTED]' ;;\nesac\n").unwrap();
+    let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("sh"))
+        .find(|path| path.is_file())
+        .expect("POSIX shell on PATH");
+    fs::write(&program, format!("#!{}\ncase \"$1\" in\nread) echo 'Volume: 0.75 [MUTED]' ;;\nlimit-unmute) test \"$2\" = 50 && echo 'Volume: 0.30' ;;\nlimit) echo 'Volume: 0.40 [MUTED]' ;;\nesac\n", shell.display())).unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
