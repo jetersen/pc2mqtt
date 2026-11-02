@@ -45,6 +45,21 @@ fn default_port() -> u16 {
     1883
 }
 
+fn tls_transport(websocket: bool) -> Transport {
+    let mut tls = rumqttc::TlsConfiguration::default();
+    if let rumqttc::TlsConfiguration::Rustls(config) = &mut tls {
+        // This client connects to one broker, not hundreds of different servers.
+        std::sync::Arc::get_mut(config)
+            .expect("new TLS config")
+            .resumption = rumqttc::tokio_rustls::rustls::client::Resumption::in_memory_sessions(1);
+    }
+    if websocket {
+        Transport::wss_with_config(tls)
+    } else {
+        Transport::tls_with_config(tls)
+    }
+}
+
 impl MqttConfig {
     fn options(&self, client_id: String) -> MqttOptions {
         let Some(endpoint) = &self.url else {
@@ -62,9 +77,9 @@ impl MqttConfig {
         let host = url.host_str().expect("MQTT URL requires a host");
         let (transport, port, websocket) = match url.scheme() {
             "mqtt" => (Transport::Tcp, 1883, false),
-            "mqtts" => (Transport::tls_with_default_config(), 8883, false),
+            "mqtts" => (tls_transport(false), 8883, false),
             "ws" => (Transport::Ws, 80, true),
-            "wss" => (Transport::wss_with_default_config(), 443, true),
+            "wss" => (tls_transport(true), 443, true),
             _ => panic!("MQTT URL scheme must be mqtt, mqtts, ws, or wss"),
         };
         assert!(
@@ -307,6 +322,8 @@ fn main() {
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        // Only MQTT, the update socket, Comin, and helper pipes are active.
+        .max_io_events_per_tick(64)
         .build()
         .expect("agent runtime")
         .block_on(run_mqtt(&Config::load()));
@@ -316,6 +333,8 @@ fn mqtt_options(cfg: &Config, topics: &Topics) -> MqttOptions {
     let mut opts = cfg.mqtt.options(format!("pc2mqtt-{}", cfg.device_name));
     opts.set_credentials(&cfg.mqtt.username, &cfg.mqtt.password);
     opts.set_keep_alive(Duration::from_mins(1));
+    // Bound outstanding publications without changing incoming command handling.
+    opts.set_inflight(8);
     opts.set_last_will(LastWill::new(
         &topics.availability,
         "offline",
