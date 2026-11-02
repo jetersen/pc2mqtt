@@ -10,298 +10,120 @@ use std::{
 
 const TOPIC: &str = "fixture/button/update/command";
 
-use pc2mqtt::comin::{
-    self,
-    comin_server::{Comin, CominServer},
-};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
-use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
-
-#[derive(Clone)]
-struct MockComin {
-    state: Arc<Mutex<comin::State>>,
-    fetches: Arc<AtomicUsize>,
-    deployments: Arc<AtomicUsize>,
-    events: tokio::sync::broadcast::Sender<comin::Event>,
+fn binary() -> std::ffi::OsString {
+    std::env::var_os("PC2MQTT_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into())
 }
-
-#[tonic::async_trait]
-impl Comin for MockComin {
-    async fn get_state(
-        &self,
-        _: tonic::Request<()>,
-    ) -> Result<tonic::Response<comin::State>, tonic::Status> {
-        Ok(tonic::Response::new(self.state.lock().unwrap().clone()))
-    }
-    async fn fetch(&self, _: tonic::Request<()>) -> Result<tonic::Response<()>, tonic::Status> {
-        self.fetches.fetch_add(1, Ordering::SeqCst);
-        Ok(tonic::Response::new(()))
-    }
-    async fn deployment_latest_submit(
-        &self,
-        request: tonic::Request<comin::Operation>,
-    ) -> Result<tonic::Response<()>, tonic::Status> {
-        assert_eq!(request.into_inner().operation_submitted, "switch");
-        self.state
-            .lock()
-            .unwrap()
-            .deployer
-            .as_mut()
-            .unwrap()
-            .is_deploying = Some(true);
-        self.deployments.fetch_add(1, Ordering::SeqCst);
-        self.events.send(comin::Event::default()).ok();
-        Ok(tonic::Response::new(()))
-    }
-    type EventsStream = ReceiverStream<Result<comin::Event, tonic::Status>>;
-    async fn events(
-        &self,
-        _: tonic::Request<()>,
-    ) -> Result<tonic::Response<Self::EventsStream>, tonic::Status> {
-        let mut subscription = self.events.subscribe();
-        let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        let initial_state = self.state.lock().unwrap().clone();
-        sender
-            .send(Ok(comin::Event {
-                created_at: Some(SystemTime::now().into()),
-                r#type: Some(comin::event::Type::ManagerState(
-                    comin::event::ManagerState {
-                        state: Some(Box::new(initial_state)),
-                    },
-                )),
-            }))
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            while let Ok(event) = subscription.recv().await {
-                if sender.send(Ok(event)).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(tonic::Response::new(ReceiverStream::new(receiver)))
-    }
+fn shell() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("sh"))
+        .find(|p| p.is_file())
+        .unwrap()
 }
-
+fn executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, format!("#!{}\n{body}\n", shell().display())).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
 struct App {
     directory: PathBuf,
     child: Child,
-    comin: MockComin,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    server: Option<thread::JoinHandle<()>>,
+    audio: Option<PathBuf>,
+    quiet: bool,
 }
-
 impl App {
     fn start(port: u16) -> Self {
         Self::start_with_audio(port, None)
     }
-
     fn start_with_audio(port: u16, audio: Option<&std::path::Path>) -> Self {
         Self::start_with_output(port, audio, false)
     }
-
     fn start_with_output(port: u16, audio: Option<&std::path::Path>, quiet: bool) -> Self {
         let directory = std::env::temp_dir().join(format!("pc2mqtt-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
-        let comin = MockComin {
-            state: Arc::new(Mutex::new(comin::State {
-                is_suspended: Some(false),
-                fetcher: Some(comin::Fetcher {
-                    is_fetching: Some(false),
-                    repository_status: Some(comin::RepositoryStatus {
-                        selected_commit_id: "target".into(),
-                        ..Default::default()
-                    }),
-                }),
-                builder: Some(comin::Builder {
-                    is_evaluating: Some(false),
-                    is_building: Some(true),
-                    generation: Some(comin::Generation {
-                        selected_commit_id: "target".into(),
-                        build_status: "built".into(),
-                        out_path: "/nix/store/target".into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                deployer: Some(comin::Deployer {
-                    is_deploying: Some(false),
-                    deployment: Some(comin::Deployment {
-                        uuid: "target".into(),
-                        status: "done".into(),
-                        operation: "switch".into(),
-                        generation: Some(comin::Generation {
-                            selected_commit_id: "target".into(),
-                            out_path: "/nix/store/target".into(),
-                            ..Default::default()
-                        }),
-                    }),
-                    ..Default::default()
-                }),
-                store: Some(comin::Store {
-                    deployment_switched: "target".into(),
-                    deployments: vec![comin::Deployment {
-                        uuid: "target".into(),
-                        generation: Some(comin::Generation {
-                            selected_commit_id: "target".into(),
-                            out_path: "/nix/store/target".into(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })),
-            fetches: Arc::new(AtomicUsize::new(0)),
-            deployments: Arc::new(AtomicUsize::new(0)),
-            events: tokio::sync::broadcast::channel(64).0,
-        };
-        let (stop, server) = Self::start_server(directory.join("comin.sock"), comin.clone());
-        let config = serde_json::json!({
-            "device_id": "fixture", "device_name": "fixture", "updates": true,
-            "mqtt": {"host":"127.0.0.1", "port":port, "username":"fixture",
-                "password":"fixture", "auto_discovery_prefix":"homeassistant"}
-        });
-        fs::write(directory.join("config.json"), config.to_string()).unwrap();
-        let mut command = Command::new(
-            std::env::var_os("PC2MQTT_TEST_BINARY")
-                .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into()),
+        fs::write(
+            directory.join("config.json"),
+            serde_json::json!({
+                "device_id":"fixture", "device_name":"fixture", "updates":true,
+                "mqtt":{"host":"127.0.0.1","port":port,"username":"fixture",
+                    "password":"fixture","auto_discovery_prefix":"homeassistant"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        executable(
+            &directory.join("updater"),
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'/requests",
+                directory.display()
+            ),
         );
-        command.env_remove("PC2MQTT_AUDIO_COMMAND");
-        if quiet {
-            command.stderr(Stdio::null());
-        }
-        if let Some(audio) = audio {
-            command.env("PC2MQTT_AUDIO_COMMAND", audio);
-        }
-        let child = command
-            .env("PC2MQTT_CONFIG", directory.join("config.json"))
-            .env("PC2MQTT_UPDATE_SOCKET", directory.join("update.sock"))
-            .env("PC2MQTT_COMIN_SOCKET", directory.join("comin.sock"))
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = Self::spawn(&directory, audio, quiet);
         Self {
             directory,
             child,
-            comin,
-            stop: Some(stop),
-            server: Some(server),
+            audio: audio.map(std::path::Path::to_path_buf),
+            quiet,
         }
     }
-
-    fn start_server(
-        socket: PathBuf,
-        mock: MockComin,
-    ) -> (tokio::sync::oneshot::Sender<()>, thread::JoinHandle<()>) {
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let (ready, started) = std::sync::mpsc::channel();
-        let server = thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    let listener = tokio::net::UnixListener::bind(socket).unwrap();
-                    ready.send(()).unwrap();
-                    tokio::select! {
-                        _ = tonic::transport::Server::builder().add_service(CominServer::new(mock))
-                            .serve_with_incoming(UnixListenerStream::new(listener)) => {},
-                        _ = stopped => {},
-                    }
-                });
-        });
-        started.recv_timeout(Duration::from_secs(3)).unwrap();
-        (stop, server)
-    }
-
-    fn restart_comin(&mut self) {
-        self.stop.take().unwrap().send(()).unwrap();
-        self.server.take().unwrap().join().unwrap();
-        let socket = self.directory.join("comin.sock");
-        fs::remove_file(&socket).unwrap();
-        let (stop, server) = Self::start_server(socket, self.comin.clone());
-        self.stop = Some(stop);
-        self.server = Some(server);
-        // Simulate the systemd socket path watch.
-        assert!(
-            Command::new(
-                std::env::var_os("PC2MQTT_TEST_BINARY")
-                    .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into())
-            )
-            .arg("--request-update")
-            .env("PC2MQTT_UPDATE_SOCKET", self.directory.join("update.sock"))
-            .status()
+    fn spawn(directory: &std::path::Path, audio: Option<&std::path::Path>, quiet: bool) -> Child {
+        let mut command = Command::new(binary());
+        command.env_remove("PC2MQTT_AUDIO_COMMAND");
+        if let Some(audio) = audio {
+            command.env("PC2MQTT_AUDIO_COMMAND", audio);
+        }
+        if quiet {
+            command.stderr(Stdio::null());
+        }
+        command
+            .env("PC2MQTT_CONFIG", directory.join("config.json"))
+            .env("PC2MQTT_UPDATE_SOCKET", directory.join("update.sock"))
+            .env("PC2MQTT_UPDATE_RESULT", directory.join("result.json"))
+            .env("PC2MQTT_UPDATE_COMMAND", directory.join("updater"))
+            .stdout(Stdio::null())
+            .spawn()
             .unwrap()
-            .success()
+    }
+    fn stop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+    fn restart(&mut self) {
+        self.stop();
+        self.child = Self::spawn(&self.directory, self.audio.as_deref(), self.quiet);
+    }
+    fn report(&self, result: &str, status: &str) {
+        assert!(
+            Command::new(binary())
+                .arg("--report-update-result")
+                .env("PC2MQTT_UPDATE_SOCKET", self.directory.join("update.sock"))
+                .env("PC2MQTT_UPDATE_RESULT", self.directory.join("result.json"))
+                .env("SERVICE_RESULT", result)
+                .env("EXIT_STATUS", status)
+                .status()
+                .unwrap()
+                .success()
         );
     }
-
-    fn set_busy(&self, busy: bool) {
-        self.comin
-            .state
-            .lock()
-            .unwrap()
-            .builder
-            .as_mut()
-            .unwrap()
-            .is_building = Some(busy);
-        // An event wakes the client; modifying state alone must not do so.
-        self.comin.events.send(comin::Event::default()).ok();
+    fn requests(&self) -> usize {
+        fs::read_to_string(self.directory.join("requests"))
+            .unwrap_or_default()
+            .lines()
+            .count()
     }
-
-    fn finish_fetch(&self) {
-        self.comin
-            .events
-            .send(comin::Event {
-                created_at: Some(SystemTime::now().into()),
-                r#type: Some(comin::event::Type::Fetched(comin::event::Fetched {
-                    repository_status: self
-                        .comin
-                        .state
-                        .lock()
-                        .unwrap()
-                        .fetcher
-                        .as_ref()
-                        .unwrap()
-                        .repository_status
-                        .clone(),
-                })),
-            })
-            .unwrap();
-    }
-
-    fn fetches(&self) -> usize {
-        self.comin.fetches.load(Ordering::SeqCst)
-    }
-
-    fn wait_for_fetch(&self, minimum: usize) {
+    fn wait_for_requests(&self, minimum: usize) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while self.fetches() < minimum {
-            assert!(Instant::now() < deadline, "fetch was not requested");
+        while self.requests() < minimum {
+            assert!(Instant::now() < deadline, "upgrade was not requested");
             thread::sleep(Duration::from_millis(10));
         }
     }
 }
-
 impl Drop for App {
     fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        if let Some(stop) = self.stop.take() {
-            stop.send(()).ok();
-        }
-        if let Some(server) = self.server.take() {
-            server.join().unwrap();
-        }
+        self.stop();
         fs::remove_dir_all(&self.directory).ok();
     }
 }
-
 struct Broker(TcpStream, Vec<(String, Vec<u8>, bool)>);
 
 impl Broker {
@@ -321,11 +143,7 @@ impl Broker {
         let mut broker = Self(stream, Vec::new());
         let (header, connect) = broker.read(Duration::from_secs(3)).unwrap();
         assert_eq!(header >> 4, 1);
-        assert_eq!(
-            connect[7] & 2,
-            0,
-            "update subscriptions need a persistent session"
-        );
+        assert_eq!(connect[7] & 2, 2, "commands must use a clean session");
         broker
             .0
             .write_all(&[0x20, 2, u8::from(session_present), 0])
@@ -485,371 +303,6 @@ impl Broker {
         }
         false
     }
-}
-
-#[test]
-fn update_acknowledgements_wait_for_comin_and_survive_reconnection() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut app = App::start(listener.local_addr().unwrap().port());
-    let mut broker = Broker::accept(&listener, false);
-    broker.wait_for_subscription();
-    broker.publish(42, false, false);
-    assert!(!broker.acknowledged(42, Duration::from_millis(200)));
-    assert_eq!(app.fetches(), 0);
-
-    // A burst shares the same worker, even when its wakeup socket fills.
-    for id in 100..132 {
-        broker.publish(id, false, false);
-    }
-
-    // A rejected retained command is acknowledged without starting a fetch.
-    broker.publish(43, true, false);
-    assert!(broker.acknowledged(43, Duration::from_secs(2)));
-    assert_eq!(app.fetches(), 0);
-    let requested = Command::new(
-        std::env::var_os("PC2MQTT_TEST_BINARY")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into()),
-    )
-    .arg("--request-update")
-    .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
-    .status()
-    .unwrap();
-    assert!(requested.success());
-
-    // Allow the queued local request to observe the busy state first.
-    thread::sleep(Duration::from_millis(300));
-    // Changing readiness alone does not trigger polling, even after the old interval.
-    app.comin
-        .state
-        .lock()
-        .unwrap()
-        .builder
-        .as_mut()
-        .unwrap()
-        .is_building = Some(false);
-    thread::sleep(Duration::from_millis(1200));
-    assert_eq!(app.fetches(), 0);
-    app.set_busy(false);
-    app.wait_for_fetch(1);
-    assert!(
-        !broker.acknowledged(42, Duration::from_millis(200)),
-        "submission is not completion"
-    );
-    // A buffered completion from an older fetch cannot acknowledge this batch.
-    app.comin
-        .events
-        .send(comin::Event {
-            created_at: Some(SystemTime::UNIX_EPOCH.into()),
-            r#type: Some(comin::event::Type::Fetched(comin::event::Fetched {
-                repository_status: Some(comin::RepositoryStatus::default()),
-            })),
-        })
-        .unwrap();
-    assert!(!broker.acknowledged(42, Duration::from_millis(200)));
-    broker.publish(45, false, false);
-    app.finish_fetch();
-    assert!(broker.acknowledged(42, Duration::from_secs(5)));
-    assert!(!broker.acknowledged(45, Duration::from_millis(200)));
-    app.wait_for_fetch(2);
-    app.finish_fetch();
-    assert!(broker.acknowledged(45, Duration::from_secs(3)));
-
-    app.set_busy(true);
-    broker.publish(44, false, false);
-    assert!(!broker.acknowledged(44, Duration::from_millis(200)));
-    drop(broker);
-    let mut broker = Broker::accept(&listener, true);
-    broker.wait_for_subscription();
-    broker.publish(44, false, true);
-    assert!(!broker.acknowledged(44, Duration::from_millis(200)));
-    let previous = app.fetches();
-    app.set_busy(false);
-    app.wait_for_fetch(previous + 1);
-    app.comin
-        .events
-        .send(comin::Event {
-            created_at: Some(SystemTime::now().into()),
-            r#type: Some(comin::event::Type::Fetched(comin::event::Fetched {
-                repository_status: Some(comin::RepositoryStatus {
-                    error_msg: "network unavailable".into(),
-                    ..Default::default()
-                }),
-            })),
-        })
-        .unwrap();
-    assert!(!broker.acknowledged(44, Duration::from_millis(1200)));
-    assert_eq!(
-        app.fetches(),
-        previous + 1,
-        "failed fetch must wait for an event"
-    );
-    let requested = Command::new(
-        std::env::var_os("PC2MQTT_TEST_BINARY")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into()),
-    )
-    .arg("--request-update")
-    .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
-    .status()
-    .unwrap();
-    assert!(requested.success());
-    app.wait_for_fetch(previous + 2);
-    app.finish_fetch();
-    assert!(broker.acknowledged(44, Duration::from_secs(5)));
-    assert!(app.fetches() >= 2);
-
-    app.set_busy(true);
-    broker.publish(46, false, false);
-    assert!(!broker.acknowledged(46, Duration::from_millis(200)));
-    app.restart_comin();
-    assert!(!broker.acknowledged(46, Duration::from_millis(200)));
-    let previous = app.fetches();
-    app.set_busy(false);
-    app.wait_for_fetch(previous + 1);
-    app.finish_fetch();
-    assert!(broker.acknowledged(46, Duration::from_secs(3)));
-}
-
-#[test]
-fn deployment_discovery_tracks_idle_events_and_republishes_after_mqtt_reconnect() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut app = App::start(listener.local_addr().unwrap().port());
-    let mut broker = Broker::accept(&listener, false);
-    broker.wait_for_subscription();
-    broker.wait_for_status("updating");
-    {
-        let mut state = app.comin.state.lock().unwrap();
-        state.need_to_reboot = Some(true);
-        state.store = Some(comin::Store {
-            deployment_switched: "new".into(),
-            deployment_booted: "old".into(),
-            deployments: [("new", "deployed"), ("old", "booted")]
-                .into_iter()
-                .map(|(id, revision)| comin::Deployment {
-                    uuid: id.into(),
-                    generation: Some(comin::Generation {
-                        selected_commit_id: revision.into(),
-                        out_path: if id == "new" {
-                            "/nix/store/target"
-                        } else {
-                            "/nix/store/old"
-                        }
-                        .into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-                .collect(),
-        });
-    }
-    app.set_busy(false);
-    let status = broker.wait_for_status("updating");
-    // The fetch request is still pending even though Comin is momentarily idle.
-    assert_eq!(status["deployed_revision"], "deployed");
-    assert_eq!(status["booted_revision"], "booted");
-    assert_eq!(status["reboot_required"], true);
-    app.wait_for_fetch(1);
-    app.finish_fetch();
-    thread::sleep(Duration::from_millis(300));
-    app.comin.state.lock().unwrap().is_suspended = Some(true);
-    app.comin.events.send(comin::Event::default()).unwrap();
-    broker.wait_for_status("suspended");
-    let configs: Vec<_> = broker
-        .1
-        .iter()
-        .filter(|(topic, _, _)| topic.ends_with("/config"))
-        .collect();
-    assert_eq!(configs.len(), 6);
-    assert!(configs.iter().all(|(_, _, retained)| *retained));
-    drop(broker);
-    let mut broker = Broker::accept(&listener, true);
-    broker.wait_for_subscription();
-    broker.wait_for_status("suspended");
-    {
-        let mut state = app.comin.state.lock().unwrap();
-        state.is_suspended = Some(false);
-        state.deployer.as_mut().unwrap().deployment = Some(comin::Deployment {
-            status: "failed".into(),
-            ..Default::default()
-        });
-    }
-    app.comin.events.send(comin::Event::default()).unwrap();
-    broker.wait_for_status("failed");
-    app.stop.take().unwrap().send(()).unwrap();
-    app.server.take().unwrap().join().unwrap();
-    broker.wait_for_status("unavailable");
-}
-
-#[test]
-fn reconnect_restores_the_fetched_generation_before_acknowledging_updates() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let app = App::start(listener.local_addr().unwrap().port());
-    {
-        let mut state = app.comin.state.lock().unwrap();
-        let store = state.store.as_mut().unwrap();
-        store.deployment_switched = "old-boot".into();
-        store.deployments.push(comin::Deployment {
-            uuid: "old-boot".into(),
-            generation: Some(comin::Generation {
-                out_path: "/nix/store/old-boot".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-    }
-    let mut broker = Broker::accept(&listener, false);
-    broker.wait_for_subscription();
-    broker.publish(60, false, false);
-    app.set_busy(false);
-    app.wait_for_fetch(1);
-    app.finish_fetch();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while app.comin.deployments.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "older boot was not reconciled");
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        !broker.acknowledged(60, Duration::from_millis(300)),
-        "fetch/submit is not convergence"
-    );
-    for _ in 0..3 {
-        app.comin.events.send(comin::Event::default()).unwrap();
-    }
-    assert!(!broker.acknowledged(60, Duration::from_millis(300)));
-    assert_eq!(app.comin.deployments.load(Ordering::SeqCst), 1);
-    // An MQTT reconnect replays the unacknowledged request, never loses it.
-    drop(broker);
-    let mut broker = Broker::accept(&listener, true);
-    broker.wait_for_subscription();
-    broker.publish(60, false, true);
-    assert!(!broker.acknowledged(60, Duration::from_millis(200)));
-    {
-        let mut state = app.comin.state.lock().unwrap();
-        state.store.as_mut().unwrap().deployment_switched = "target".into();
-        state.deployer.as_mut().unwrap().is_deploying = Some(false);
-    }
-    app.comin.events.send(comin::Event::default()).unwrap();
-    // The replay belongs to the next request batch, which fetches again.
-    app.wait_for_fetch(2);
-    app.finish_fetch();
-    assert!(broker.acknowledged(60, Duration::from_secs(3)));
-    assert_eq!(app.comin.deployments.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn a_new_commit_waits_for_its_build_instead_of_resubmitting_an_old_deployment() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let app = App::start(listener.local_addr().unwrap().port());
-    let mut broker = Broker::accept(&listener, false);
-    broker.wait_for_subscription();
-    broker.publish(61, false, false);
-    app.comin
-        .state
-        .lock()
-        .unwrap()
-        .fetcher
-        .as_mut()
-        .unwrap()
-        .repository_status
-        .as_mut()
-        .unwrap()
-        .selected_commit_id = "new-target".into();
-    app.set_busy(false);
-    app.wait_for_fetch(1);
-    app.finish_fetch();
-    assert!(!broker.acknowledged(61, Duration::from_millis(300)));
-    assert_eq!(app.comin.deployments.load(Ordering::SeqCst), 0);
-    // Another successful fetch during deployment supersedes this batch's target.
-    app.comin
-        .state
-        .lock()
-        .unwrap()
-        .fetcher
-        .as_mut()
-        .unwrap()
-        .repository_status
-        .as_mut()
-        .unwrap()
-        .selected_commit_id = "newer-target".into();
-    app.finish_fetch();
-    {
-        let mut state = app.comin.state.lock().unwrap();
-        state
-            .builder
-            .as_mut()
-            .unwrap()
-            .generation
-            .as_mut()
-            .unwrap()
-            .selected_commit_id = "new-target".into();
-    }
-    app.comin.events.send(comin::Event::default()).unwrap();
-    assert!(!broker.acknowledged(61, Duration::from_millis(300)));
-    {
-        let mut state = app.comin.state.lock().unwrap();
-        state
-            .builder
-            .as_mut()
-            .unwrap()
-            .generation
-            .as_mut()
-            .unwrap()
-            .selected_commit_id = "newer-target".into();
-        // An unchanged system derivation needs no redeployment.
-    }
-    app.comin.events.send(comin::Event::default()).unwrap();
-    assert!(broker.acknowledged(61, Duration::from_secs(3)));
-}
-
-#[test]
-fn rejected_branch_history_keeps_the_update_queued_until_a_successful_retry() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let app = App::start(listener.local_addr().unwrap().port());
-    let mut broker = Broker::accept(&listener, false);
-    broker.wait_for_subscription();
-    broker.publish(62, false, false);
-    app.set_busy(false);
-    app.wait_for_fetch(1);
-    app.comin
-        .state
-        .lock()
-        .unwrap()
-        .fetcher
-        .as_mut()
-        .unwrap()
-        .repository_status
-        .as_mut()
-        .unwrap()
-        .remotes
-        .push(comin::Remote {
-            main: Some(comin::Branch {
-                error_msg: "this branch has been hard reset".into(),
-            }),
-            ..Default::default()
-        });
-    app.finish_fetch();
-    assert!(!broker.acknowledged(62, Duration::from_millis(400)));
-    broker.wait_for_status("failed");
-    assert_eq!(
-        app.fetches(),
-        1,
-        "a rejected branch must wait for another event"
-    );
-    app.comin
-        .state
-        .lock()
-        .unwrap()
-        .fetcher
-        .as_mut()
-        .unwrap()
-        .repository_status
-        .as_mut()
-        .unwrap()
-        .remotes
-        .clear();
-    app.comin.events.send(comin::Event::default()).unwrap();
-    app.wait_for_fetch(2);
-    app.finish_fetch();
-    assert!(broker.acknowledged(62, Duration::from_secs(3)));
 }
 
 #[test]
@@ -1031,12 +484,7 @@ fn benchmark_idle() {
         while let Some((header, body)) = broker.read(Duration::from_millis(300)) {
             broker.respond(header, &body);
         }
-        measure(
-            &app,
-            &mut broker,
-            &format!("audio={audio} connected-comin-wait"),
-        );
-        app.comin.events.send(comin::Event::default()).unwrap();
+        measure(&app, &mut broker, &format!("audio={audio} connected-idle"));
         broker.0.shutdown(std::net::Shutdown::Both).unwrap();
         drop(broker);
         let before = sample(app.child.id());
@@ -1047,7 +495,7 @@ fn benchmark_idle() {
             started.elapsed().as_secs_f64(),
             sample(app.child.id())
         );
-        let mut broker = Broker::accept(&listener, true);
+        let mut broker = Broker::accept(&listener, false);
         broker.wait_for_subscription();
         while let Some((header, body)) = broker.read(Duration::from_millis(300)) {
             broker.respond(header, &body);
@@ -1066,7 +514,7 @@ fn benchmark_idle() {
 }
 
 #[test]
-fn blocked_audio_does_not_stall_mqtt_or_comin_and_times_out() {
+fn blocked_audio_does_not_stall_mqtt_or_updates_and_times_out() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("pc2mqtt-blocked-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&dir).unwrap();
@@ -1093,10 +541,8 @@ fn blocked_audio_does_not_stall_mqtt_or_comin_and_times_out() {
     broker.publish_topic(41, true, false, "fixture/button/shutdown/command", b"PRESS");
     assert!(broker.acknowledged(41, Duration::from_millis(500)));
     broker.publish(42, false, false);
-    app.set_busy(false);
-    app.wait_for_fetch(1);
-    app.finish_fetch();
-    assert!(broker.acknowledged(42, Duration::from_secs(1)));
+    assert!(broker.acknowledged(42, Duration::from_millis(500)));
+    app.wait_for_requests(2);
     let state = broker.wait_for_audio("blocked");
     assert_eq!(state["available"], false);
     assert_eq!(state["limit_ok"], false);
@@ -1158,4 +604,91 @@ fn expired_and_contradicted_audio_confirmations_cannot_authorize_playback() {
     assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], false);
     drop(app);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn updates_launch_systemd_and_reject_retained_commands() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start(listener.local_addr().unwrap().port());
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    app.wait_for_requests(1);
+    broker.publish(41, true, false);
+    assert!(broker.acknowledged(41, Duration::from_millis(500)));
+    assert_eq!(app.requests(), 1);
+    broker.publish(42, false, false);
+    assert!(broker.acknowledged(42, Duration::from_millis(500)));
+    app.wait_for_requests(2);
+    assert!(
+        fs::read_to_string(app.directory.join("requests"))
+            .unwrap()
+            .lines()
+            .all(|line| line == "--no-block start nixos-upgrade.service")
+    );
+    assert!(
+        Command::new(binary())
+            .arg("--request-update")
+            .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    app.wait_for_requests(3);
+}
+
+#[test]
+fn results_survive_agent_downtime_and_broker_reconnection() {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut app = App::start(listener.local_addr().unwrap().port());
+    app.report("exit-code", "1");
+    assert_eq!(
+        fs::metadata(app.directory.join("result.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    let result = broker.wait_for_status("failed");
+    assert_eq!(result["result"], "exit-code");
+    assert_eq!(result["exit_status"], "1");
+    broker.0.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(broker);
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    assert_eq!(broker.wait_for_status("failed"), result);
+    app.stop();
+    // ExecStopPost reports completion even while the MQTT process is stopped.
+    app.report("success", "0");
+    app.restart();
+    drop(broker);
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    assert_eq!(broker.wait_for_status("idle")["result"], "success");
+}
+
+#[test]
+fn failed_or_blocked_launchers_report_failure_without_stalling_mqtt() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start(listener.local_addr().unwrap().port());
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_subscription();
+    app.wait_for_requests(1);
+    executable(&app.directory.join("updater"), "exit 1");
+    broker.publish(41, false, false);
+    assert!(broker.acknowledged(41, Duration::from_millis(500)));
+    assert_eq!(broker.wait_for_status("failed")["result"], "launch-failed");
+    executable(&app.directory.join("updater"), "exec sleep 30");
+    broker.publish(42, false, false);
+    broker.publish_topic(43, true, false, "fixture/button/shutdown/command", b"PRESS");
+    assert!(broker.acknowledged(43, Duration::from_millis(500)));
+    assert!(
+        broker.wait_for_status("failed")["exit_status"]
+            .as_str()
+            .unwrap()
+            .contains("timed out")
+    );
 }

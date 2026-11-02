@@ -8,7 +8,7 @@ Control your PC or homeserver from Home Assistant through MQTT.
 - Shutdown button
 - Reboot button
 - Optional desktop speaker volume control
-- Comin deployment status, deployed revision, and reboot-required sensor (when updates are enabled)
+- Last system upgrade result (when updates are enabled)
 
 ![homeassistant](.github/images/homeassistant.png)
 
@@ -78,49 +78,38 @@ Publish commands without retention; MQTT can forward a newly retained publicatio
 to an existing subscriber without marking it as retained.
 
 On NixOS hosts, set top-level `"updates": true` to enable
-`<device_name>/button/update/command`. pc2mqtt requests a Comin fetch immediately
-over `/var/lib/comin/grpc.sock` when the daemon is unsuspended and idle. Set
-`PC2MQTT_COMIN_SOCKET` to override this path. MQTT, the gRPC event stream, and audio helper I/O share one current-thread Tokio
-runtime. Comin waits for events and never polls readiness.
-Completion events get one brief settling delay because Comin emits some events
-before clearing its busy flags. Requests do not spawn additional workers. A stopped
-or suspended Comin stays that way until explicitly started or resumed. A settled failed generation
-causes an active Comin daemon to restart before fetching the unchanged commit.
+`<device_name>/button/update/command`. A non-retained `PRESS` starts
+`nixos-upgrade.service` through `systemctl --no-block`. The service owns the job,
+so upgrading or restarting pc2mqtt does not interrupt it. systemd coalesces starts
+while the service is active. Commands use ordinary MQTT acknowledgements; an
+acknowledgement means receipt, not that the upgrade completed.
 
-QoS 1 update commands remain queued after fetching until the selected generation
-is active, or Comin has staged a boot-only deployment. If an older generation is
-running but Comin remembers deploying the selected commit, the worker resubmits
-that deployment through gRPC. It preserves the deployment operation and never
-bypasses suspension or reboot-only inhibitors. A new commit waits for its own
-build rather than resubmitting an older deployment. Deployment telemetry stays
-`updating` while a request is pending, unless Comin reports failure or suspension.
+Use NixOS's `system.autoUpgrade` module to configure the service. No Comin daemon,
+gRPC connection, or progress polling is needed. pc2mqtt checks for updates when
+MQTT connects. `pc2mqtt --request-update` sends the same request through the private
+`/run/pc2mqtt/update.sock`; `PC2MQTT_UPDATE_SOCKET` overrides its location.
+`PC2MQTT_UPDATE_COMMAND` can select a launcher executable for another installation;
+it receives `--no-block start nixos-upgrade.service`. Launchers time out after two
+seconds; the upgrade itself runs independently under systemd.
 
-Persistent MQTT sessions allow unacknowledged commands to be redelivered after
-reconnecting. Startup and broker connections also request an update, covering
-missed notifications. Branch-selection errors, including rejected rewritten history,
-keep requests queued and report failure even when the Git transport succeeds.
-Retained command replays remain ignored.
+Set the upgrade unit's `ExecStopPost` to `/path/to/pc2mqtt --report-update-result`.
+This reads systemd's `SERVICE_RESULT` and `EXIT_STATUS`, atomically saves the last
+completed result in `/var/lib/pc2mqtt/update-result.json`, and wakes the MQTT agent.
+Set `StateDirectory=pc2mqtt` with mode `0700` on both services. Override the result
+path with `PC2MQTT_UPDATE_RESULT` if needed. Reporting also works while the agent
+is stopped. The latest result is published when MQTT reconnects.
 
-`pc2mqtt --request-update` queues a local request through
-`/run/pc2mqtt/update.sock`, or `PC2MQTT_UPDATE_SOCKET` if set. The socket permits
-access only to the service account. Use this for manual checks and resume/network
-hooks. Use a systemd path unit watching Comin's socket with `PathChanged` to invoke
-it when Comin starts or replaces the socket. Socket failures and failed fetches wait
-for another lifecycle, MQTT, or Comin event; there is no periodic retry. The service
-needs access to Comin's socket and `systemctl` on `PATH` solely to restart an active
-daemon after a settled generation failure (Comin 0.14 has no retry-generation RPC).
-Leave updates disabled on hosts without Comin. Restrict command publishers with broker ACLs.
+Home Assistant discovers the Deployment result sensor. Retained JSON on
+`<device_name>/deployment/state` contains `state` (`idle` on success, `failed`
+on failure), `result` (systemd's outcome), `exit_status`, and `completed_at`
+(Unix seconds). Launcher failures use `result: "launch-failed"`. Allow this topic
+in the broker ACL and use a Home Assistant automation to notify your phone when
+`state` is `failed`. Retained results replay after reconnects; `completed_at` can
+identify the same result when deduplicating notifications. Detailed logs remain
+in `journalctl -u nixos-upgrade.service`.
 
-When updates are enabled, Home Assistant discovers three diagnostic entities on the
-existing device. Retained JSON on `<device_name>/deployment/state` contains
-`state` (`idle`, `updating`, `suspended`, `failed`, or `unavailable`),
-`deployed_revision`, `booted_revision`, and `reboot_required`. Revisions refer to
-Comin's actual switched and booted deployments, not the pending build. Unknown
-revisions or reboot requirements are `null`. The existing Comin event stream
-refreshes this snapshot without polling, and MQTT reconnects republish it. Host
-availability uses the existing last will; Comin disconnections mark deployment
-telemetry unavailable. Allow the state topic and the three discovery topics in
-broker ACLs alongside the existing power entities.
+The former Comin revision and reboot-required entities are removed from discovery.
+Audio cap acknowledgements remain correlated and expiring independently of upgrades.
 
 ## Build
 
@@ -130,7 +119,7 @@ cargo build --release
 
 `--version` prints the embedded git SHA.
 
-For an isolated Linux idle benchmark with a mock broker, Comin, and audio adapter:
+For an isolated Linux idle benchmark with a mock broker, upgrade launcher, and audio adapter:
 
 ```sh
 cargo test --release --target x86_64-unknown-linux-gnu --test mqtt_updates benchmark_idle -- --ignored --nocapture

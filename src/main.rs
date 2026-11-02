@@ -7,7 +7,7 @@ mod updates;
 
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, time::Duration};
 use uuid::Uuid;
 
 const GIT_SHA: &str = env!("GIT_SHA");
@@ -329,11 +329,19 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|argument| argument == "--report-update-result") {
+        if let Err(error) = updates::report_result() {
+            eprintln!("Could not save update result: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     println!("pc2mqtt {GIT_SHA} starting");
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        // Only MQTT, the update socket, Comin, and helper pipes are active.
+        // Only MQTT, the update socket, and helper pipes are active.
         .max_io_events_per_tick(64)
         .build()
         .expect("agent runtime")
@@ -352,9 +360,6 @@ fn mqtt_options(cfg: &Config, topics: &Topics) -> MqttOptions {
         QoS::AtLeastOnce,
         true,
     ));
-    // Keep unhandled QoS 1 update commands available across reconnections.
-    opts.set_clean_session(!cfg.updates);
-    opts.set_manual_acks(cfg.updates);
 
     opts
 }
@@ -374,13 +379,11 @@ async fn run_mqtt(cfg: &Config) {
         discoveries.push(audio::discovery(cfg));
     }
     let mut initial_connect_done = false;
-    let mut acknowledgements = VecDeque::new();
 
     loop {
         let event = connection.poll().await;
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                acknowledgements.clear();
                 println!("Connected to MQTT broker");
                 if let Some(updates) = &updates {
                     client
@@ -425,41 +428,24 @@ async fn run_mqtt(cfg: &Config) {
                     && accepted
                     && p.topic == topics.cmd_update
                 {
-                    updates.request(p);
-                } else {
-                    if accepted {
-                        match p.topic.as_str() {
-                            t if t == topics.cmd_shutdown => {
-                                tokio::spawn(systemctl("poweroff"));
-                            }
-                            t if t == topics.cmd_reboot => {
-                                tokio::spawn(systemctl("reboot"));
-                            }
-                            _ => {}
+                    updates.request();
+                } else if accepted {
+                    match p.topic.as_str() {
+                        t if t == topics.cmd_shutdown => {
+                            tokio::spawn(systemctl("poweroff"));
                         }
-                    }
-                    // Keep rejected and unrelated commands moving even when a burst
-                    // of completed updates fills the MQTT outgoing request channel.
-                    if updates.is_some() {
-                        acknowledgements.push_back(p);
+                        t if t == topics.cmd_reboot => {
+                            tokio::spawn(systemctl("reboot"));
+                        }
+                        _ => {}
                     }
                 }
             }
             Err(e) => {
-                if let Some(updates) = &updates {
-                    updates.disconnected();
-                }
-                acknowledgements.clear();
                 eprintln!("Connection error: {e} — retrying...");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             _ => {}
-        }
-        while let Some(publish) = acknowledgements.front() {
-            if client.try_ack(publish).is_err() {
-                break;
-            }
-            acknowledgements.pop_front();
         }
     }
 }
