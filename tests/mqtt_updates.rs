@@ -100,6 +100,10 @@ impl App {
     }
 
     fn start_with_audio(port: u16, audio: Option<&std::path::Path>) -> Self {
+        Self::start_with_output(port, audio, false)
+    }
+
+    fn start_with_output(port: u16, audio: Option<&std::path::Path>, quiet: bool) -> Self {
         let directory = std::env::temp_dir().join(format!("pc2mqtt-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let comin = MockComin {
@@ -163,8 +167,14 @@ impl App {
                 "password":"fixture", "auto_discovery_prefix":"homeassistant"}
         });
         fs::write(directory.join("config.json"), config.to_string()).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_pc2mqtt"));
+        let mut command = Command::new(
+            std::env::var_os("PC2MQTT_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into()),
+        );
         command.env_remove("PC2MQTT_AUDIO_COMMAND");
+        if quiet {
+            command.stderr(Stdio::null());
+        }
         if let Some(audio) = audio {
             command.env("PC2MQTT_AUDIO_COMMAND", audio);
         }
@@ -219,12 +229,15 @@ impl App {
         self.server = Some(server);
         // Simulate the systemd socket path watch.
         assert!(
-            Command::new(env!("CARGO_BIN_EXE_pc2mqtt"))
-                .arg("--request-update")
-                .env("PC2MQTT_UPDATE_SOCKET", self.directory.join("update.sock"))
-                .status()
-                .unwrap()
-                .success()
+            Command::new(
+                std::env::var_os("PC2MQTT_TEST_BINARY")
+                    .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into())
+            )
+            .arg("--request-update")
+            .env("PC2MQTT_UPDATE_SOCKET", self.directory.join("update.sock"))
+            .status()
+            .unwrap()
+            .success()
         );
     }
 
@@ -493,11 +506,14 @@ fn update_acknowledgements_wait_for_comin_and_survive_reconnection() {
     broker.publish(43, true, false);
     assert!(broker.acknowledged(43, Duration::from_secs(2)));
     assert_eq!(app.fetches(), 0);
-    let requested = Command::new(env!("CARGO_BIN_EXE_pc2mqtt"))
-        .arg("--request-update")
-        .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
-        .status()
-        .unwrap();
+    let requested = Command::new(
+        std::env::var_os("PC2MQTT_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into()),
+    )
+    .arg("--request-update")
+    .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
+    .status()
+    .unwrap();
     assert!(requested.success());
 
     // Allow the queued local request to observe the busy state first.
@@ -567,11 +583,14 @@ fn update_acknowledgements_wait_for_comin_and_survive_reconnection() {
         previous + 1,
         "failed fetch must wait for an event"
     );
-    let requested = Command::new(env!("CARGO_BIN_EXE_pc2mqtt"))
-        .arg("--request-update")
-        .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
-        .status()
-        .unwrap();
+    let requested = Command::new(
+        std::env::var_os("PC2MQTT_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_pc2mqtt").into()),
+    )
+    .arg("--request-update")
+    .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
+    .status()
+    .unwrap();
     assert!(requested.success());
     app.wait_for_fetch(previous + 2);
     app.finish_fetch();
@@ -880,4 +899,263 @@ fn audio_caps_are_correlated_and_unmute_is_confirmed() {
     assert_eq!(state["available"], false);
     drop(app);
     fs::remove_dir_all(directory).unwrap();
+}
+
+// Linux-only, opt-in release benchmark. No live services or audio are used.
+// Run with: cargo test --release --target x86_64-unknown-linux-gnu --test mqtt_updates benchmark_idle -- --ignored --nocapture
+#[test]
+#[ignore = "60+ seconds of isolated process measurements"]
+#[cfg(target_os = "linux")]
+fn benchmark_idle() {
+    use std::os::unix::fs::PermissionsExt;
+    fn sample(pid: u32) -> serde_json::Value {
+        let root = format!("/proc/{pid}");
+        let stat = fs::read_to_string(format!("{root}/stat")).unwrap();
+        let fields: Vec<_> = stat[stat.rfind(')').unwrap() + 2..]
+            .split_whitespace()
+            .collect();
+        let mut result = serde_json::Map::new();
+        for (name, index) in [
+            ("cpu_ticks", 11),
+            ("child_cpu_ticks", 13),
+            ("minor_faults", 7),
+        ] {
+            let value = fields[index].parse::<u64>().unwrap()
+                + if name.ends_with("cpu_ticks") {
+                    fields[index + 1].parse::<u64>().unwrap()
+                } else {
+                    0
+                };
+            result.insert(name.into(), value.into());
+        }
+        for file in ["status", "smaps_rollup"] {
+            for line in fs::read_to_string(format!("{root}/{file}"))
+                .unwrap()
+                .lines()
+            {
+                let mut words = line.split_whitespace();
+                let key = words.next().unwrap_or_default().trim_end_matches(':');
+                if matches!(
+                    key,
+                    "Rss" | "Pss" | "Private_Clean" | "Private_Dirty" | "VmSize" | "Threads"
+                ) {
+                    result.insert(
+                        key.into(),
+                        words.next().unwrap().parse::<u64>().unwrap().into(),
+                    );
+                }
+            }
+        }
+        let mut switches = 0u64;
+        for task in fs::read_dir(format!("{root}/task")).unwrap() {
+            for line in fs::read_to_string(task.unwrap().path().join("status"))
+                .unwrap()
+                .lines()
+            {
+                if line.starts_with("voluntary_ctxt_switches:")
+                    || line.starts_with("nonvoluntary_ctxt_switches:")
+                {
+                    switches += line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap();
+                }
+            }
+        }
+        result.insert("context_switches".into(), switches.into());
+        result.into()
+    }
+    fn measure(app: &App, broker: &mut Broker, label: &str) {
+        let before = sample(app.child.id());
+        let started = Instant::now();
+        let mut packets = 0;
+        while started.elapsed() < Duration::from_secs(15) {
+            if let Some((header, body)) = broker.read(Duration::from_secs(1)) {
+                broker.respond(header, &body);
+                packets += 1;
+            }
+        }
+        println!(
+            "BENCH {label} seconds={:.3} packets={packets} before={before} after={}",
+            started.elapsed().as_secs_f64(),
+            sample(app.child.id())
+        );
+    }
+    for audio in [false, true] {
+        if !audio && std::env::var_os("PC2MQTT_BENCH_ALL").is_none() {
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("pc2mqtt-bench-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let program = dir.join("adapter");
+        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|p| p.join("sh"))
+            .find(|p| p.is_file())
+            .unwrap();
+        fs::write(
+            &program,
+            format!(
+                "#!{}\necho read >> '{}'/calls\necho 'Volume: 0.30 [MUTED]'\n",
+                shell.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = unavailable.local_addr().unwrap().port();
+        drop(unavailable);
+        let app = App::start_with_output(port, audio.then_some(program.as_path()), true);
+        thread::sleep(Duration::from_secs(1));
+        let before = sample(app.child.id());
+        let started = Instant::now();
+        thread::sleep(Duration::from_secs(5));
+        println!(
+            "BENCH audio={audio} broker-refused seconds={:.3} before={before} after={}",
+            started.elapsed().as_secs_f64(),
+            sample(app.child.id())
+        );
+        drop(app);
+        fs::remove_file(dir.join("calls")).ok();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let app = App::start_with_output(
+            listener.local_addr().unwrap().port(),
+            audio.then_some(program.as_path()),
+            true,
+        );
+        let mut broker = Broker::accept(&listener, false);
+        broker.wait_for_subscription();
+        // Drain startup and let the initial Comin event settle before sampling.
+        while let Some((header, body)) = broker.read(Duration::from_millis(300)) {
+            broker.respond(header, &body);
+        }
+        measure(
+            &app,
+            &mut broker,
+            &format!("audio={audio} connected-comin-wait"),
+        );
+        app.comin.events.send(comin::Event::default()).unwrap();
+        broker.0.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(broker);
+        let before = sample(app.child.id());
+        let started = Instant::now();
+        thread::sleep(Duration::from_secs(5));
+        println!(
+            "BENCH audio={audio} broker-wait seconds={:.3} before={before} after={}",
+            started.elapsed().as_secs_f64(),
+            sample(app.child.id())
+        );
+        let mut broker = Broker::accept(&listener, true);
+        broker.wait_for_subscription();
+        while let Some((header, body)) = broker.read(Duration::from_millis(300)) {
+            broker.respond(header, &body);
+        }
+        measure(&app, &mut broker, &format!("audio={audio} reconnected"));
+        println!(
+            "BENCH audio={audio} helper_calls={}",
+            fs::read_to_string(dir.join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        );
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn blocked_audio_does_not_stall_mqtt_or_comin_and_times_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-blocked-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let program = dir.join("adapter");
+    let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("sh"))
+        .find(|p| p.is_file())
+        .unwrap();
+    fs::write(&program, format!("#!{}\ncase \"$1\" in\nread) echo 'Volume: 0.30 [MUTED]' ;;\n*) exec sleep 30 ;;\nesac\n", shell.display())).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/volume/limit");
+    let request = serde_json::json!({"maximum":50,"request_id":"blocked","expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+20.0});
+    broker.publish_topic(
+        40,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        request.to_string().as_bytes(),
+    );
+    // Retained power commands are safe fixtures and must be promptly rejected/acked.
+    broker.publish_topic(41, true, false, "fixture/button/shutdown/command", b"PRESS");
+    assert!(broker.acknowledged(41, Duration::from_millis(500)));
+    broker.publish(42, false, false);
+    app.set_busy(false);
+    app.wait_for_fetch(1);
+    app.finish_fetch();
+    assert!(broker.acknowledged(42, Duration::from_secs(1)));
+    let state = broker.wait_for_audio("blocked");
+    assert_eq!(state["available"], false);
+    assert_eq!(state["limit_ok"], false);
+    drop(app);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn expired_and_contradicted_audio_confirmations_cannot_authorize_playback() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-expiry-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let program = dir.join("adapter");
+    let reading = dir.join("reading");
+    fs::write(&reading, "Volume: 0.30\n").unwrap();
+    let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("sh"))
+        .find(|p| p.is_file())
+        .unwrap();
+    fs::write(
+        &program,
+        format!(
+            "#!{}\nif test \"$1\" = limit-unmute; then sleep 1; fi\ncat '{}'\n",
+            shell.display(),
+            reading.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/volume/limit");
+    let request = |id: &str, lifetime, unmute| serde_json::json!({"maximum":50,"request_id":id,"unmute":unmute,"expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+lifetime});
+    broker.publish_topic(
+        41,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        request("expired", 0.5, true).to_string().as_bytes(),
+    );
+    let state = broker.wait_for_audio("expired");
+    assert_eq!(state["available"], true);
+    assert_eq!(state["limit_ok"], false);
+    broker.publish_topic(
+        42,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        request("contradicted", 40.0, false).to_string().as_bytes(),
+    );
+    assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], true);
+    fs::write(&reading, "Volume: 0.90\n").unwrap();
+    // wait_for_audio normally allows 5s; allow an entire sampling interval here.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], false);
+    fs::write(&reading, "Volume: 0.30\n").unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], false);
+    drop(app);
+    fs::remove_dir_all(dir).unwrap();
 }

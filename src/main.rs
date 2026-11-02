@@ -5,9 +5,9 @@ mod audio;
 mod deployment;
 mod updates;
 
-use rumqttc::{Client, Event, LastWill, MqttOptions, Packet, QoS, Transport};
+use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, io, path::PathBuf, process::Command, time::Duration};
+use std::{collections::VecDeque, io, path::PathBuf, time::Duration};
 use uuid::Uuid;
 
 const GIT_SHA: &str = env!("GIT_SHA");
@@ -272,11 +272,13 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
     payloads
 }
 
-fn systemctl(op: &str) {
+async fn systemctl(op: &str) {
     eprintln!("Executing systemctl {op}...");
-    match Command::new("systemctl")
+    match tokio::process::Command::new("systemctl")
         .args(["--no-block", "--ignore-inhibitors", op])
+        .kill_on_drop(true)
         .status()
+        .await
     {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("systemctl {op} failed: {status}"),
@@ -303,12 +305,14 @@ fn main() {
 
     println!("pc2mqtt {GIT_SHA} starting");
 
-    run_mqtt(&Config::load());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("agent runtime")
+        .block_on(run_mqtt(&Config::load()));
 }
 
-fn run_mqtt(cfg: &Config) {
-    let topics = Topics::new(cfg);
-
+fn mqtt_options(cfg: &Config, topics: &Topics) -> MqttOptions {
     let mut opts = cfg.mqtt.options(format!("pc2mqtt-{}", cfg.device_name));
     opts.set_credentials(&cfg.mqtt.username, &cfg.mqtt.password);
     opts.set_keep_alive(Duration::from_mins(1));
@@ -322,7 +326,14 @@ fn run_mqtt(cfg: &Config) {
     opts.set_clean_session(!cfg.updates);
     opts.set_manual_acks(cfg.updates);
 
-    let (client, mut connection) = Client::new(opts, MQTT_QUEUE_CAPACITY);
+    opts
+}
+
+async fn run_mqtt(cfg: &Config) {
+    let topics = Topics::new(cfg);
+    let opts = mqtt_options(cfg, &topics);
+
+    let (client, mut connection) = AsyncClient::new(opts, MQTT_QUEUE_CAPACITY);
     let updates = cfg.updates.then(|| {
         updates::Updates::start(client.clone(), &cfg.device_name)
             .expect("could not start update handler")
@@ -335,35 +346,40 @@ fn run_mqtt(cfg: &Config) {
     let mut initial_connect_done = false;
     let mut acknowledgements = VecDeque::new();
 
-    for event in connection.iter() {
+    loop {
+        let event = connection.poll().await;
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 acknowledgements.clear();
                 println!("Connected to MQTT broker");
                 if let Some(updates) = &updates {
-                    client.subscribe(&topics.cmd_update, QoS::AtLeastOnce).ok();
+                    client
+                        .try_subscribe(&topics.cmd_update, QoS::AtLeastOnce)
+                        .ok();
                     updates.connected();
                 }
 
                 if !initial_connect_done {
                     for (topic, payload) in &discoveries {
                         client
-                            .publish(topic, QoS::AtLeastOnce, true, payload.as_bytes())
+                            .try_publish(topic, QoS::AtLeastOnce, true, payload.as_bytes())
                             .ok();
                     }
                     initial_connect_done = true;
                 }
 
                 client
-                    .publish(&topics.availability, QoS::AtLeastOnce, true, "online")
+                    .try_publish(&topics.availability, QoS::AtLeastOnce, true, "online")
                     .ok();
                 client
-                    .publish(&topics.power_availability, QoS::AtLeastOnce, true, "online")
+                    .try_publish(&topics.power_availability, QoS::AtLeastOnce, true, "online")
                     .ok();
                 client
-                    .subscribe(&topics.cmd_shutdown, QoS::AtLeastOnce)
+                    .try_subscribe(&topics.cmd_shutdown, QoS::AtLeastOnce)
                     .ok();
-                client.subscribe(&topics.cmd_reboot, QoS::AtLeastOnce).ok();
+                client
+                    .try_subscribe(&topics.cmd_reboot, QoS::AtLeastOnce)
+                    .ok();
 
                 if let Some(audio) = &audio {
                     audio.connected(&client);
@@ -383,8 +399,12 @@ fn run_mqtt(cfg: &Config) {
                 } else {
                     if accepted {
                         match p.topic.as_str() {
-                            t if t == topics.cmd_shutdown => systemctl("poweroff"),
-                            t if t == topics.cmd_reboot => systemctl("reboot"),
+                            t if t == topics.cmd_shutdown => {
+                                tokio::spawn(systemctl("poweroff"));
+                            }
+                            t if t == topics.cmd_reboot => {
+                                tokio::spawn(systemctl("reboot"));
+                            }
                             _ => {}
                         }
                     }
@@ -401,6 +421,7 @@ fn run_mqtt(cfg: &Config) {
                 }
                 acknowledgements.clear();
                 eprintln!("Connection error: {e} — retrying...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
             _ => {}
         }

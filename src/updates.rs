@@ -1,17 +1,15 @@
 use crate::deployment::{Status, fetch_failed};
-use rumqttc::{Client, Publish, QoS};
+use rumqttc::{AsyncClient, Publish, QoS};
 use std::{
     collections::HashSet,
     fs, io,
     os::unix::{fs::FileTypeExt, fs::PermissionsExt, net::UnixDatagram},
     path::PathBuf,
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
-    thread,
     time::{Duration, SystemTime},
 };
 
@@ -156,6 +154,18 @@ async fn state(client: &mut CominClient<Channel>) -> Result<comin::State, tonic:
     Ok(client.get_state(request).await?.into_inner())
 }
 
+#[derive(Default)]
+struct Connection {
+    epoch: AtomicU64,
+    changed: tokio::sync::Notify,
+}
+
+impl Connection {
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.epoch.load(ordering)
+    }
+}
+
 struct Receipt {
     connection: u64,
     publish: Publish,
@@ -180,15 +190,24 @@ fn drain_requests(
     }
 }
 
-fn acknowledge(pending: Vec<Request>, client: &Client, connection: &AtomicU64) {
+async fn acknowledge(pending: Vec<Request>, client: &AsyncClient, connection: &Connection) {
     let mut seen = HashSet::new();
     for request in pending {
         if let Request::Mqtt(receipt) = request
             && seen.insert((receipt.connection, receipt.publish.pkid))
             && connection.load(Ordering::SeqCst) == receipt.connection
-            && let Err(error) = client.ack(&receipt.publish)
         {
-            eprintln!("Could not acknowledge update command: {error}");
+            // Capacity can become available in a different MQTT session. Cancel
+            // a waiting send before an old packet id can acknowledge a new command.
+            tokio::select! {
+                biased;
+                () = connection.changed.notified() => {},
+                result = client.ack(&receipt.publish) => {
+                    if let Err(error) = result {
+                        eprintln!("Could not acknowledge update command: {error}");
+                    }
+                }
+            }
         }
     }
 }
@@ -206,9 +225,11 @@ async fn submit(
             Decision::RestartFailed => {
                 // No retry-generation RPC exists in Comin 0.14. This is the
                 // sole subprocess in update handling; never start a stopped service.
-                match Command::new("systemctl")
+                match tokio::process::Command::new("systemctl")
                     .args(["--no-block", "try-restart", "comin.service"])
+                    .kill_on_drop(true)
                     .status()
+                    .await
                 {
                     Ok(status) if status.success() => {
                         "Update pending: restarting Comin after a settled failure".into()
@@ -242,11 +263,11 @@ async fn submit(
 // The worker may wait for outgoing capacity; the main MQTT loop never does so
 // on its behalf. Only enqueue while connected, and retain the latest snapshot
 // locally for replay on the next connection epoch.
-fn publish_status(
-    mqtt: &Client,
+async fn publish_status(
+    mqtt: &AsyncClient,
     topic: &str,
     status: &Status,
-    connection: &AtomicU64,
+    connection: &Connection,
     published: &mut Option<(u64, Status)>,
 ) {
     let epoch = connection.load(Ordering::SeqCst);
@@ -266,6 +287,7 @@ fn publish_status(
             true,
             serde_json::to_vec(status).unwrap(),
         )
+        .await
         .is_ok()
     {
         *published = Some((epoch, status.clone()));
@@ -335,13 +357,13 @@ impl Batch {
         grpc: &mut Option<(CominClient<Channel>, tonic::Streaming<comin::Event>)>,
         snapshot: Option<&comin::State>,
         pending: &mut Vec<Request>,
-        mqtt: &Client,
-        connection: &AtomicU64,
+        mqtt: &AsyncClient,
+        connection: &Connection,
     ) -> bool {
         if let (Some(snapshot), Some(target)) = (snapshot, &self.fetched_commit) {
             match reconciliation(snapshot, target) {
                 Reconciliation::Complete => {
-                    acknowledge(std::mem::take(&mut self.requests), mqtt, connection);
+                    acknowledge(std::mem::take(&mut self.requests), mqtt, connection).await;
                     self.fetched_commit = None;
                     eprintln!("Comin update converged; update request handled");
                 }
@@ -392,8 +414,8 @@ impl Batch {
 async fn worker(
     requests: Receiver<Request>,
     socket: UnixDatagram,
-    mqtt: Client,
-    connection: Arc<AtomicU64>,
+    mqtt: AsyncClient,
+    connection: Arc<Connection>,
     status_topic: String,
 ) {
     socket
@@ -429,7 +451,7 @@ async fn worker(
                 } else {
                     batch.requeue(&mut pending);
                     let status = Status::unavailable();
-                    publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+                    publish_status(&mqtt, &status_topic, &status, &connection, &mut published).await;
                     grpc = connect().await.ok();
                     // If unavailable, the socket path watch wakes us when ready.
                     eprintln!("Comin disconnected; waiting for a lifecycle or MQTT event");
@@ -448,7 +470,8 @@ async fn worker(
                 Ok(connected) => grpc = Some(connected),
                 Err(error) => {
                     let status = Status::unavailable();
-                    publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+                    publish_status(&mqtt, &status_topic, &status, &connection, &mut published)
+                        .await;
                     eprintln!("Comin unavailable: {error}");
                     continue;
                 }
@@ -472,7 +495,7 @@ async fn worker(
         if (!pending.is_empty() || !batch.requests.is_empty()) && status.state == "idle" {
             status.state = "updating";
         }
-        publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+        publish_status(&mqtt, &status_topic, &status, &connection, &mut published).await;
         if pending.is_empty() || !batch.requests.is_empty() || failed_fetch || grpc.is_none() {
             continue;
         }
@@ -486,11 +509,11 @@ async fn worker(
         if !batch.requests.is_empty() {
             // Comin 0.14 emits Fetched but has no FetchStarted event.
             status.state = "updating";
-            publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+            publish_status(&mqtt, &status_topic, &status, &connection, &mut published).await;
         }
         if grpc.is_none() {
             status = Status::unavailable();
-            publish_status(&mqtt, &status_topic, &status, &connection, &mut published);
+            publish_status(&mqtt, &status_topic, &status, &connection, &mut published).await;
             // The socket may already have been replaced before the old channel
             // reports failure. Reconnect once for this event; never run a retry loop.
             grpc = connect().await.ok();
@@ -506,11 +529,11 @@ pub struct Updates {
     requests: Sender<Request>,
     wake: UnixDatagram,
     // A new connection gets a new odd value; disconnection clears its low bit.
-    connection: Arc<AtomicU64>,
+    connection: Arc<Connection>,
 }
 
 impl Updates {
-    pub fn start(client: Client, device_name: &str) -> io::Result<Self> {
+    pub fn start(client: AsyncClient, device_name: &str) -> io::Result<Self> {
         let status_topic = format!("{device_name}/deployment/state");
         let path = socket_path();
         if let Some(parent) = path.parent() {
@@ -538,23 +561,15 @@ impl Updates {
         wake.set_nonblocking(true)?;
 
         let (requests, receiver) = mpsc::channel();
-        let connection = Arc::new(AtomicU64::new(0));
+        let connection = Arc::new(Connection::default());
         let worker_connection = Arc::clone(&connection);
-        thread::Builder::new()
-            .name("pc2mqtt-update".into())
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("update runtime")
-                    .block_on(worker(
-                        receiver,
-                        socket,
-                        client,
-                        worker_connection,
-                        status_topic,
-                    ));
-            })?;
+        tokio::spawn(worker(
+            receiver,
+            socket,
+            client,
+            worker_connection,
+            status_topic,
+        ));
         let updates = Self {
             requests,
             wake,
@@ -579,13 +594,15 @@ impl Updates {
     }
 
     pub fn connected(&self) {
-        self.connection.fetch_add(2, Ordering::SeqCst);
-        self.connection.fetch_or(1, Ordering::SeqCst);
+        self.connection.epoch.fetch_add(2, Ordering::SeqCst);
+        self.connection.epoch.fetch_or(1, Ordering::SeqCst);
+        self.connection.changed.notify_waiters();
         self.queue(Request::Local);
     }
 
     pub fn disconnected(&self) {
-        self.connection.fetch_and(!1, Ordering::SeqCst);
+        self.connection.epoch.fetch_and(!1, Ordering::SeqCst);
+        self.connection.changed.notify_waiters();
     }
 
     pub fn request(&self, publish: Publish) {
@@ -599,6 +616,37 @@ impl Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_cancels_an_acknowledgement_waiting_for_capacity() {
+        let (client, _eventloop) =
+            AsyncClient::new(rumqttc::MqttOptions::new("fixture", "127.0.0.1", 1883), 1);
+        client
+            .try_publish("full", QoS::AtLeastOnce, false, "fixture")
+            .unwrap();
+        let connection = Connection::default();
+        connection.epoch.store(1, Ordering::SeqCst);
+        let mut publish = Publish::new("update", QoS::AtLeastOnce, "PRESS");
+        publish.pkid = 42;
+        let mut ack = Box::pin(acknowledge(
+            vec![Request::Mqtt(Receipt {
+                connection: 1,
+                publish,
+            })],
+            &client,
+            &connection,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), ack.as_mut())
+                .await
+                .is_err()
+        );
+        connection.epoch.store(0, Ordering::SeqCst);
+        connection.changed.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(100), ack)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn reconciliation_preserves_suspension_boot_operations_and_unknown_state() {

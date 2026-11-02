@@ -1,13 +1,10 @@
 //! Optional host audio adapter. Commands are argv, never shell input.
 use std::{
     path::PathBuf,
-    process::Command,
-    sync::mpsc::{self, SyncSender},
-    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rumqttc::{Client, Publish, QoS};
+use rumqttc::{AsyncClient, Publish, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -42,6 +39,7 @@ struct Limit {
 #[derive(Debug)]
 enum Work {
     Read,
+    Connected,
     Set(f64),
     Limit(Limit),
 }
@@ -98,16 +96,18 @@ struct Reading {
 }
 
 fn parse_reading(output: &str) -> Result<Reading, &'static str> {
-    let fields: Vec<_> = output.split_whitespace().collect();
-    if fields.first() != Some(&"Volume:") || !(2..=3).contains(&fields.len()) {
+    let mut fields = output.split_whitespace();
+    if fields.next() != Some("Volume:") {
         return Err("unexpected audio adapter output");
     }
-    let raw: f64 = fields[1].parse().map_err(|_| "invalid audio volume")?;
+    let value = fields.next().ok_or("missing audio volume")?;
+    let raw: f64 = value.parse().map_err(|_| "invalid audio volume")?;
     if !raw.is_finite() || !(0.0..=10.0).contains(&raw) {
         return Err("audio volume out of range");
     }
-    let muted = fields.get(2) == Some(&"[MUTED]");
-    if fields.len() == 3 && !muted {
+    let mute = fields.next();
+    let muted = mute == Some("[MUTED]");
+    if (mute.is_some() && !muted) || fields.next().is_some() {
         return Err("unexpected audio mute state");
     }
     Ok(Reading {
@@ -116,14 +116,20 @@ fn parse_reading(output: &str) -> Result<Reading, &'static str> {
     })
 }
 
-fn execute(program: &PathBuf, operation: &str, value: Option<f64>) -> Result<Reading, String> {
-    let mut command = Command::new(program);
+async fn execute(
+    program: &PathBuf,
+    operation: &str,
+    value: Option<f64>,
+) -> Result<Reading, String> {
+    let mut command = tokio::process::Command::new(program);
     command.arg(operation);
     if let Some(value) = value {
         command.arg(value.to_string());
     }
-    let output = command
-        .output()
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(2), command.output())
+        .await
+        .map_err(|_| "audio adapter timed out")?
         .map_err(|e| format!("audio adapter failed: {e}"))?;
     if !output.status.success() {
         return Err(format!("audio adapter exited with {}", output.status));
@@ -134,10 +140,10 @@ fn execute(program: &PathBuf, operation: &str, value: Option<f64>) -> Result<Rea
 
 pub struct Audio {
     topics: Topics,
-    work: SyncSender<Work>,
+    work: tokio::sync::mpsc::Sender<Work>,
 }
 impl Audio {
-    pub fn start(client: Client, cfg: &Config) -> Option<Self> {
+    pub fn start(client: AsyncClient, cfg: &Config) -> Option<Self> {
         let program = PathBuf::from(std::env::var_os("PC2MQTT_AUDIO_COMMAND")?);
         assert!(
             program.is_absolute(),
@@ -145,26 +151,34 @@ impl Audio {
         );
         let topics = Topics::new(&cfg.device_name);
         let worker_topics = topics.clone();
-        let (sender, receiver) = mpsc::sync_channel(8);
-        thread::Builder::new()
-            .name("audio".into())
-            .spawn(move || {
-                let mut acknowledgement: Option<(String, bool)> = None;
-                loop {
-                    let work = match receiver.recv_timeout(Duration::from_secs(5)) {
-                        Ok(work) => work,
-                        Err(mpsc::RecvTimeoutError::Timeout) => Work::Read,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    };
-                    if let Work::Limit(request) = &work
-                        && !limit_valid(request, now())
-                    {
-                        continue;
-                    }
-                    let result = match &work {
-                        Work::Read => execute(&program, "read", None),
-                        Work::Set(value) => execute(&program, "set", Some(*value)),
-                        Work::Limit(request) => execute(
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut acknowledgement: Option<(Limit, bool)> = None;
+            let mut published = None;
+            loop {
+                let work = match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await
+                {
+                    Ok(Some(work)) => work,
+                    Ok(None) => return,
+                    Err(_) => Work::Read,
+                };
+                if matches!(work, Work::Connected) {
+                    acknowledgement = None;
+                    published = None;
+                }
+                if matches!(work, Work::Set(_)) {
+                    acknowledgement = None;
+                }
+                if let Work::Limit(request) = &work
+                    && !limit_valid(request, now())
+                {
+                    continue;
+                }
+                let result = match &work {
+                    Work::Read | Work::Connected => execute(&program, "read", None).await,
+                    Work::Set(value) => execute(&program, "set", Some(*value)).await,
+                    Work::Limit(request) => {
+                        execute(
                             &program,
                             if request.unmute {
                                 "limit-unmute"
@@ -172,49 +186,68 @@ impl Audio {
                                 "limit"
                             },
                             Some(request.maximum),
-                        ),
-                    };
-                    if let Work::Limit(request) = &work {
-                        let success = result.as_ref().is_ok_and(|r| {
+                        )
+                        .await
+                    }
+                };
+                if let Err(error) = &result {
+                    eprintln!("Audio: {error}");
+                }
+                if let Work::Limit(request) = work {
+                    let success = result.is_ok();
+                    acknowledgement = Some((request, success));
+                }
+                let reading = result.ok();
+                // Once a confirmation fails, expires, or is contradicted, a later
+                // read must not revive it. Only a new request can authorize playback.
+                if let Some((request, success)) = &mut acknowledgement {
+                    *success &= limit_valid(request, now())
+                        && reading.is_some_and(|r| {
                             r.volume <= request.maximum && (!request.unmute || !r.muted)
                         });
-                        acknowledgement = Some((request.request_id.clone(), success));
-                    }
-                    if let Err(error) = &result {
-                        eprintln!("Audio: {error}");
-                    }
-                    let (request_id, limit_ok) = acknowledgement
-                        .as_ref()
-                        .map_or((None, false), |(id, ok)| (Some(id), *ok));
-                    let reading = result.ok();
-                    let state = json!({
-                        "volume": reading.map(|r| r.volume),
-                        "muted": reading.map(|r| r.muted),
-                        "available": reading.is_some(),
-                        "request_id": request_id,
-                        "limit_ok": limit_ok,
+                }
+                let (request_id, limit_ok) = acknowledgement
+                    .as_ref()
+                    .map_or((None, false), |(request, success)| {
+                        (Some(&request.request_id), *success)
                     });
-                    client
+                let state = json!({
+                    "volume": reading.map(|r| r.volume),
+                    "muted": reading.map(|r| r.muted),
+                    "available": reading.is_some(),
+                    "request_id": request_id,
+                    "limit_ok": limit_ok,
+                })
+                .to_string();
+                if published.as_ref() != Some(&state)
+                    && client
                         .publish(
                             &worker_topics.state,
                             QoS::AtLeastOnce,
                             true,
-                            state.to_string(),
+                            state.as_bytes(),
                         )
-                        .ok();
+                        .await
+                        .is_ok()
+                {
+                    published = Some(state);
                 }
-            })
-            .expect("could not start audio handler");
+            }
+        });
         Some(Self {
             topics,
             work: sender,
         })
     }
 
-    pub fn connected(&self, client: &Client) {
-        client.subscribe(&self.topics.set, QoS::AtLeastOnce).ok();
-        client.subscribe(&self.topics.limit, QoS::AtLeastOnce).ok();
-        self.work.try_send(Work::Read).ok();
+    pub fn connected(&self, client: &AsyncClient) {
+        client
+            .try_subscribe(&self.topics.set, QoS::AtLeastOnce)
+            .ok();
+        client
+            .try_subscribe(&self.topics.limit, QoS::AtLeastOnce)
+            .ok();
+        self.work.try_send(Work::Connected).ok();
     }
 
     pub fn handle(&self, publish: &Publish) {

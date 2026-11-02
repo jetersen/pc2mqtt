@@ -39,9 +39,13 @@ WantedBy=multi-user.target
 
 Set `PC2MQTT_AUDIO_COMMAND` to an absolute executable path to expose a speaker-volume
 number through MQTT discovery. The adapter must run in the desktop user's audio
-session and have a bounded execution time. It accepts `read`, `set PERCENT`,
+session. The agent times out helpers after two seconds. It accepts `read`, `set PERCENT`,
 `limit PERCENT`, and `limit-unmute PERCENT`, returning `wpctl get-volume` output.
 Limits must never raise quieter output; `limit-unmute` must cap before unmuting.
+Audio reads run every five seconds to detect changes made outside MQTT. Unchanged
+readings are not republished. Reconnects refresh the state and clear previous cap
+confirmations. A failed, expired, or contradicted confirmation cannot become valid
+again without a new limit request.
 
 The agent rejects retained audio commands. Correlated, expiring limit requests on
 `<device_name>/audio/volume/limit` provide confirmation before another automation
@@ -76,8 +80,8 @@ to an existing subscriber without marking it as retained.
 On NixOS hosts, set top-level `"updates": true` to enable
 `<device_name>/button/update/command`. pc2mqtt requests a Comin fetch immediately
 over `/var/lib/comin/grpc.sock` when the daemon is unsuspended and idle. Set
-`PC2MQTT_COMIN_SOCKET` to override this path. The gRPC event stream wakes one shared
-update worker; it uses a single-thread async runtime and never polls readiness.
+`PC2MQTT_COMIN_SOCKET` to override this path. MQTT, the gRPC event stream, and audio helper I/O share one current-thread Tokio
+runtime. Comin waits for events and never polls readiness.
 Completion events get one brief settling delay because Comin emits some events
 before clearing its busy flags. Requests do not spawn additional workers. A stopped
 or suspended Comin stays that way until explicitly started or resumed. A settled failed generation
@@ -125,3 +129,18 @@ cargo build --release
 ```
 
 `--version` prints the embedded git SHA.
+
+For an isolated Linux idle benchmark with a mock broker, Comin, and audio adapter:
+
+```sh
+cargo test --release --target x86_64-unknown-linux-gnu --test mqtt_updates benchmark_idle -- --ignored --nocapture
+```
+
+It samples `/proc` at each window's boundaries, reporting RSS/PSS/private memory
+in KiB, reserved virtual size, thread count, CPU ticks (use `getconf CLK_TCK`),
+minor faults, and aggregate thread context switches. It also counts MQTT packets
+and fixture helper calls. Connected and reconnected windows last 15 seconds;
+broker waiting and connection-refused windows last five seconds. Audio is enabled
+by default; set `PC2MQTT_BENCH_ALL=1` to also measure it disabled. The mock broker blocks between packets and
+responds to keepalives. `PC2MQTT_TEST_BINARY` selects a saved release binary for
+comparisons. Context switches are a wakeup proxy, not a hardware wakeup counter.
