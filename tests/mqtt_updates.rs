@@ -96,6 +96,10 @@ struct App {
 
 impl App {
     fn start(port: u16) -> Self {
+        Self::start_with_audio(port, None)
+    }
+
+    fn start_with_audio(port: u16, audio: Option<&std::path::Path>) -> Self {
         let directory = std::env::temp_dir().join(format!("pc2mqtt-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let comin = MockComin {
@@ -159,7 +163,12 @@ impl App {
                 "password":"fixture", "auto_discovery_prefix":"homeassistant"}
         });
         fs::write(directory.join("config.json"), config.to_string()).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_pc2mqtt"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pc2mqtt"));
+        command.env_remove("PC2MQTT_AUDIO_COMMAND");
+        if let Some(audio) = audio {
+            command.env("PC2MQTT_AUDIO_COMMAND", audio);
+        }
+        let child = command
             .env("PC2MQTT_CONFIG", directory.join("config.json"))
             .env("PC2MQTT_UPDATE_SOCKET", directory.join("update.sock"))
             .env("PC2MQTT_COMIN_SOCKET", directory.join("comin.sock"))
@@ -362,11 +371,15 @@ impl Broker {
     }
 
     fn wait_for_subscription(&mut self) {
+        self.wait_for_topic(TOPIC);
+    }
+
+    fn wait_for_topic(&mut self, topic: &str) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             let (header, body) = self.read(Duration::from_millis(100)).unwrap_or_default();
             self.respond(header, &body);
-            if header >> 4 == 8 && body[4..body.len() - 1] == *TOPIC.as_bytes() {
+            if header >> 4 == 8 && body[4..body.len() - 1] == *topic.as_bytes() {
                 return;
             }
         }
@@ -393,16 +406,56 @@ impl Broker {
     }
 
     fn publish(&mut self, id: u16, retained: bool, duplicate: bool) {
-        let topic_length = u16::try_from(TOPIC.len()).unwrap();
+        self.publish_topic(id, retained, duplicate, TOPIC, b"PRESS");
+    }
+
+    fn publish_topic(
+        &mut self,
+        id: u16,
+        retained: bool,
+        duplicate: bool,
+        topic: &str,
+        payload: &[u8],
+    ) {
+        let topic_length = u16::try_from(topic.len()).unwrap();
         let mut body = Vec::from(topic_length.to_be_bytes());
-        body.extend_from_slice(TOPIC.as_bytes());
+        body.extend_from_slice(topic.as_bytes());
         body.extend_from_slice(&id.to_be_bytes());
-        body.extend_from_slice(b"PRESS");
+        body.extend_from_slice(payload);
         let header = 0x32 | u8::from(retained) | (u8::from(duplicate) << 3);
-        self.0
-            .write_all(&[header, u8::try_from(body.len()).unwrap()])
-            .unwrap();
-        self.0.write_all(&body).unwrap();
+        let mut length = body.len();
+        let mut packet = vec![header];
+        loop {
+            let mut byte = u8::try_from(length % 128).unwrap();
+            length /= 128;
+            if length > 0 {
+                byte |= 128;
+            }
+            packet.push(byte);
+            if length == 0 {
+                break;
+            }
+        }
+        packet.extend_from_slice(&body);
+        self.0.write_all(&packet).unwrap();
+    }
+
+    fn wait_for_audio(&mut self, request_id: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(index) = self.1.iter().position(|(topic, payload, _)| {
+                topic == "fixture/audio/volume/state"
+                    && serde_json::from_slice::<serde_json::Value>(payload).unwrap()["request_id"]
+                        == request_id
+            }) {
+                let (_, payload, _) = self.1.remove(index);
+                return serde_json::from_slice(&payload).unwrap();
+            }
+            assert!(Instant::now() < deadline, "missing audio acknowledgement");
+            if let Some((header, body)) = self.read(Duration::from_millis(100)) {
+                self.respond(header, &body);
+            }
+        }
     }
 
     fn acknowledged(&mut self, id: u16, timeout: Duration) -> bool {
@@ -778,4 +831,49 @@ fn rejected_branch_history_keeps_the_update_queued_until_a_successful_retry() {
     app.wait_for_fetch(2);
     app.finish_fetch();
     assert!(broker.acknowledged(62, Duration::from_secs(3)));
+}
+
+#[test]
+fn audio_caps_are_correlated_and_unmute_is_confirmed() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::env::temp_dir().join(format!("pc2mqtt-audio-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&directory).unwrap();
+    let program = directory.join("adapter");
+    fs::write(&program, "#!/bin/sh\ncase \"$1\" in\nread) echo 'Volume: 0.75 [MUTED]' ;;\nlimit-unmute) test \"$2\" = 50 && echo 'Volume: 0.30' ;;\nlimit) echo 'Volume: 0.40 [MUTED]' ;;\nesac\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/volume/limit");
+    let request = serde_json::json!({
+        "maximum":50, "request_id":"cap-unmute", "unmute":true,
+        "expires_at": SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+20.0,
+    });
+    broker.publish_topic(
+        42,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        request.to_string().as_bytes(),
+    );
+    let state = broker.wait_for_audio("cap-unmute");
+    assert_eq!(state["limit_ok"], true);
+    assert_eq!(state["muted"], false);
+    assert_eq!(state["volume"], 30.0);
+    let failed = serde_json::json!({
+        "maximum": 40, "request_id": "cap-failed", "unmute": true,
+        "expires_at": SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() + 20.0,
+    });
+    broker.publish_topic(
+        43,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        failed.to_string().as_bytes(),
+    );
+    let state = broker.wait_for_audio("cap-failed");
+    assert_eq!(state["limit_ok"], false);
+    assert_eq!(state["available"], false);
+    drop(app);
+    fs::remove_dir_all(directory).unwrap();
 }

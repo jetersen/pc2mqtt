@@ -7,6 +7,7 @@ Control your PC or homeserver from Home Assistant through MQTT.
 - Power sensor
 - Shutdown button
 - Reboot button
+- Optional desktop speaker volume control
 - Comin deployment status, deployed revision, and reboot-required sensor (when updates are enabled)
 
 ![homeassistant](.github/images/homeassistant.png)
@@ -33,6 +34,19 @@ RuntimeDirectoryMode=0700
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Optional speaker volume control
+
+Set `PC2MQTT_AUDIO_COMMAND` to an absolute executable path to expose a speaker-volume
+number through MQTT discovery. The adapter must run in the desktop user's audio
+session and have a bounded execution time. It accepts `read`, `set PERCENT`,
+`limit PERCENT`, and `limit-unmute PERCENT`, returning `wpctl get-volume` output.
+Limits must never raise quieter output; `limit-unmute` must cap before unmuting.
+
+The agent rejects retained audio commands. Correlated, expiring limit requests on
+`<device_name>/audio/volume/limit` provide confirmation before another automation
+starts playback. Permit the discovery, state, set, and limit topics in the broker
+ACL. See [the audio protocol](src/audio.rs) for payload fields and validation.
 
 ## Config
 

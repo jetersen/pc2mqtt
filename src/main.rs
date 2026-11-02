@@ -1,6 +1,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod audio;
 mod deployment;
 mod updates;
 
@@ -11,7 +12,7 @@ use uuid::Uuid;
 
 const GIT_SHA: &str = env!("GIT_SHA");
 // Leave room for discovery, availability, and subscriptions before polling again.
-const MQTT_QUEUE_CAPACITY: usize = 16;
+const MQTT_QUEUE_CAPACITY: usize = 32;
 
 fn config_path() -> PathBuf {
     std::env::var_os("PC2MQTT_CONFIG")
@@ -302,8 +303,11 @@ fn main() {
 
     println!("pc2mqtt {GIT_SHA} starting");
 
-    let cfg = Config::load();
-    let topics = Topics::new(&cfg);
+    run_mqtt(&Config::load());
+}
+
+fn run_mqtt(cfg: &Config) {
+    let topics = Topics::new(cfg);
 
     let mut opts = cfg.mqtt.options(format!("pc2mqtt-{}", cfg.device_name));
     opts.set_credentials(&cfg.mqtt.username, &cfg.mqtt.password);
@@ -323,7 +327,11 @@ fn main() {
         updates::Updates::start(client.clone(), &cfg.device_name)
             .expect("could not start update handler")
     });
-    let discoveries = discovery_payloads(&cfg, &topics);
+    let audio = audio::Audio::start(client.clone(), cfg);
+    let mut discoveries = discovery_payloads(cfg, &topics);
+    if audio.is_some() {
+        discoveries.push(audio::discovery(cfg));
+    }
     let mut initial_connect_done = false;
     let mut acknowledgements = VecDeque::new();
 
@@ -357,9 +365,15 @@ fn main() {
                     .ok();
                 client.subscribe(&topics.cmd_reboot, QoS::AtLeastOnce).ok();
 
+                if let Some(audio) = &audio {
+                    audio.connected(&client);
+                }
                 println!("Ready to receive commands");
             }
             Ok(Event::Incoming(Packet::Publish(p))) => {
+                if let Some(audio) = &audio {
+                    audio.handle(&p);
+                }
                 let accepted = accepts_command(p.retain, &p.payload);
                 if let Some(updates) = &updates
                     && accepted
