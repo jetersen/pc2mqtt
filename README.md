@@ -43,10 +43,27 @@ session. The agent times out helpers after two seconds and limits stdout to
 256 bytes. It accepts `read`, `set PERCENT`,
 `limit PERCENT`, and `limit-unmute PERCENT`, returning `wpctl get-volume` output.
 Limits must never raise quieter output; `limit-unmute` must cap before unmuting.
-Audio reads run every five seconds to detect changes made outside MQTT. Unchanged
-readings are not republished. Reconnects refresh the state and clear previous cap
+Build with `cargo build --release --target x86_64-unknown-linux-gnu --features pipewire`
+and set `PC2MQTT_AUDIO_SOCKET` to the desktop
+session's PipeWire socket (for example `/run/user/1000/pipewire-0`) to detect
+changes outside MQTT. This requires the PipeWire development package at build
+time and its client library at runtime. The passive listener runs on the MQTT
+event loop, without a data loop, realtime thread, or periodic reads. It watches
+the default speaker, software volume/mute, and hardware routes. Commands still
+run through the desktop-user adapter. Without a notification source, audio is
+read on MQTT connection and commands only. Unchanged readings are not
+republished. Reconnects refresh the state and clear previous cap
 confirmations. A failed, expired, or contradicted confirmation cannot become valid
-again without a new limit request.
+again without a new limit request. Expiry uses a one-shot timer. A default-speaker
+change or lost audio session also clears confirmations. Reconnection retries
+back off to 60 seconds while PipeWire is unavailable; a healthy listener has no
+retry timer.
+
+An external listener can instead notify `PC2MQTT_AUDIO_EVENT_SOCKET`, a private
+Unix datagram socket created by the agent. Send `C` for a change, `R` when the
+default-speaker identity changes, or `D` for a disconnected audio session.
+Notifications trigger bounded reads; they cannot provide or authorize cap
+confirmations themselves.
 
 The agent rejects retained audio commands. Correlated, expiring limit requests on
 `<device_name>/audio/volume/limit` provide confirmation before another automation
@@ -134,3 +151,9 @@ broker waiting and connection-refused windows last five seconds. Audio is enable
 by default; set `PC2MQTT_BENCH_ALL=1` to also measure it disabled. The mock broker blocks between packets and
 responds to keepalives. `PC2MQTT_TEST_BINARY` selects a saved release binary for
 comparisons. Context switches are a wakeup proxy, not a hardware wakeup counter.
+The default audio fixture measures notification handling and bounded commands.
+To include the native listener, build with `--features pipewire` and set
+`PC2MQTT_BENCH_PIPEWIRE_SOCKET` to an isolated PipeWire server's socket. The native
+unit test provides a two-speaker server fixture. A real desktop socket is also
+safe for this idle benchmark: commands still use the mock adapter, but other
+desktop clients can add graph notifications and affect wakeup counts.

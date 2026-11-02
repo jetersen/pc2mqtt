@@ -3,6 +3,13 @@ name = "pc2mqtt"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+pipewire = ["dep:cc", "dep:pkg-config"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
+
 [dependencies]
 http = "1"
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls", "websocket"] }

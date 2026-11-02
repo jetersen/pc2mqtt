@@ -1,7 +1,11 @@
 //! Optional host audio adapter. Commands are argv, never shell input.
+mod events;
+
 use std::{
+    cell::Cell,
     path::PathBuf,
     process::Stdio,
+    rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -42,6 +46,7 @@ struct Limit {
 enum Work {
     Read,
     Connected,
+    Publish,
     Set(f64),
     Limit(Limit),
 }
@@ -193,9 +198,217 @@ impl Published {
     }
 }
 
+struct Worker {
+    acknowledgement: Option<(Limit, bool)>,
+    published: Option<Published>,
+    reading: Option<Reading>,
+    events: events::Events,
+    refresh: bool,
+    retry: Option<tokio::time::Instant>,
+    retry_delay: u64,
+}
+impl Worker {
+    fn new() -> Self {
+        let mut retry = None;
+        let events = events::Events::open().unwrap_or_else(|error| {
+            eprintln!("Audio events: {error}");
+            retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            events::Events::Disabled
+        });
+        Self {
+            acknowledgement: None,
+            published: None,
+            reading: None,
+            events,
+            refresh: false,
+            retry,
+            retry_delay: 1,
+        }
+    }
+    fn disconnected(&mut self) {
+        if self.events.disconnect() {
+            self.retry = Some(tokio::time::Instant::now() + Duration::from_secs(self.retry_delay));
+            self.retry_delay = (self.retry_delay * 2).min(60);
+        }
+        self.reading = None;
+    }
+    async fn next(&mut self, receiver: &mut tokio::sync::mpsc::Receiver<Work>) -> Option<Work> {
+        loop {
+            if std::mem::take(&mut self.refresh) {
+                return Some(Work::Read);
+            }
+            let expiry = self
+                .acknowledgement
+                .as_ref()
+                .filter(|(_, success)| *success)
+                .map(|(request, _)| {
+                    tokio::time::Instant::now()
+                        + Duration::from_secs_f64((request.expires_at - now()).max(0.0))
+                });
+            tokio::select! {
+                biased;
+                flags = self.events.next() => {
+                    if flags & events::RESET != 0 { self.acknowledgement = None; }
+                    if flags & events::DISCONNECTED != 0 {
+                        self.disconnected();
+                        return Some(Work::Publish);
+                    }
+                    if flags & events::CHANGED != 0 {
+                        self.retry_delay = 1;
+                        return Some(Work::Read);
+                    }
+                }
+                work = receiver.recv() => return work,
+                () = deadline(expiry) => return Some(Work::Publish),
+                () = deadline(self.retry) => {
+                    if let Ok(source) = events::Events::open() {
+                        self.events = source; self.retry = None;
+                    } else {
+                        self.retry_delay = (self.retry_delay * 2).min(60);
+                        self.retry = Some(tokio::time::Instant::now() + Duration::from_secs(self.retry_delay));
+                    }
+                }
+            }
+        }
+    }
+    async fn perform(&mut self, work: Work, program: &PathBuf, connection_epoch: &Cell<u64>) {
+        if matches!(work, Work::Publish) {
+            return;
+        }
+        if matches!(work, Work::Connected) {
+            self.acknowledgement = None;
+            self.published = None;
+        }
+        if matches!(work, Work::Set(_)) {
+            self.acknowledgement = None;
+        }
+        let epoch = connection_epoch.get();
+        let mut result = match &work {
+            Work::Read | Work::Connected => execute(program, "read", None).await,
+            Work::Set(value) => execute(program, "set", Some(*value)).await,
+            Work::Limit(request) => {
+                execute(
+                    program,
+                    if request.unmute {
+                        "limit-unmute"
+                    } else {
+                        "limit"
+                    },
+                    Some(request.maximum),
+                )
+                .await
+            }
+            Work::Publish => unreachable!(),
+        };
+        // A speaker swap or reconnect during a helper invalidates its result.
+        // Verify concurrent volume changes before publishing a cap confirmation.
+        let mut flags = self.events.drain();
+        if flags == events::CHANGED && result.is_ok() {
+            result = execute(program, "read", None).await;
+            flags = self.events.drain();
+            if flags & events::CHANGED != 0 {
+                result = Err("audio changed during confirmation".into());
+                self.refresh = true;
+            }
+        }
+        if flags & (events::RESET | events::DISCONNECTED) != 0 || epoch != connection_epoch.get() {
+            self.acknowledgement = None;
+            result = Err("audio session changed during operation".into());
+            self.refresh = flags & events::DISCONNECTED == 0;
+        }
+        if flags & events::DISCONNECTED != 0 {
+            self.disconnected();
+        }
+        if let Err(error) = &result {
+            eprintln!("Audio: {error}");
+        }
+        if let Work::Limit(request) = work {
+            self.acknowledgement = Some((request, result.is_ok()));
+        }
+        self.reading = result.ok();
+    }
+    async fn publish(&mut self, client: &AsyncClient, topic: &str) {
+        // A failed, expired, or contradicted confirmation never revives.
+        if let Some((request, success)) = &mut self.acknowledgement {
+            *success &= limit_valid(request, now())
+                && self
+                    .reading
+                    .is_some_and(|r| r.volume <= request.maximum && (!request.unmute || !r.muted));
+        }
+        let (request_id, limit_ok) = self
+            .acknowledgement
+            .as_ref()
+            .map_or((None, false), |(request, success)| {
+                (Some(request.request_id.as_ref()), *success)
+            });
+        if self
+            .published
+            .as_ref()
+            .is_some_and(|previous| previous.matches(self.reading, request_id, limit_ok))
+        {
+            return;
+        }
+        let state = State {
+            volume: self.reading.map(|r| r.volume),
+            muted: self.reading.map(|r| r.muted),
+            available: self.reading.is_some(),
+            request_id,
+            limit_ok,
+        };
+        if client
+            .publish(
+                topic,
+                QoS::AtLeastOnce,
+                true,
+                serde_json::to_vec(&state).unwrap(),
+            )
+            .await
+            .is_ok()
+        {
+            self.published = Some(Published {
+                reading: self.reading,
+                request_id: request_id.map(Into::into),
+                limit_ok,
+            });
+        }
+    }
+    async fn run(
+        mut self,
+        mut receiver: tokio::sync::mpsc::Receiver<Work>,
+        program: PathBuf,
+        connection_epoch: Rc<Cell<u64>>,
+        client: AsyncClient,
+        topic: String,
+    ) {
+        let mut seen_epoch = 0;
+        while let Some(work) = self.next(&mut receiver).await {
+            if seen_epoch != connection_epoch.get() {
+                self.acknowledgement = None;
+                self.published = None;
+                seen_epoch = connection_epoch.get();
+            }
+            if let Work::Limit(request) = &work
+                && !limit_valid(request, now())
+            {
+                continue;
+            }
+            self.perform(work, &program, &connection_epoch).await;
+            self.publish(&client, &topic).await;
+        }
+    }
+}
+async fn deadline(deadline: Option<tokio::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 pub struct Audio {
     topics: Topics,
     work: tokio::sync::mpsc::Sender<Work>,
+    connection_epoch: Rc<Cell<u64>>,
 }
 impl Audio {
     pub fn start(client: AsyncClient, cfg: &Config) -> Option<Self> {
@@ -204,106 +417,33 @@ impl Audio {
             program.is_absolute(),
             "PC2MQTT_AUDIO_COMMAND must be absolute"
         );
+        assert!(
+            cfg!(feature = "pipewire")
+                || std::env::var_os("PC2MQTT_AUDIO_SOCKET").is_none()
+                || std::env::var_os("PC2MQTT_AUDIO_EVENT_SOCKET").is_some(),
+            "PC2MQTT_AUDIO_SOCKET requires a build with --features pipewire"
+        );
         let topics = Topics::new(&cfg.device_name);
         let state_topic = topics.state.clone();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move {
-            let mut acknowledgement: Option<(Limit, bool)> = None;
-            let mut published: Option<Published> = None;
-            loop {
-                let work = match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await
-                {
-                    Ok(Some(work)) => work,
-                    Ok(None) => return,
-                    Err(_) => Work::Read,
-                };
-                if matches!(work, Work::Connected) {
-                    acknowledgement = None;
-                    published = None;
-                }
-                if matches!(work, Work::Set(_)) {
-                    acknowledgement = None;
-                }
-                if let Work::Limit(request) = &work
-                    && !limit_valid(request, now())
-                {
-                    continue;
-                }
-                let result = match &work {
-                    Work::Read | Work::Connected => execute(&program, "read", None).await,
-                    Work::Set(value) => execute(&program, "set", Some(*value)).await,
-                    Work::Limit(request) => {
-                        execute(
-                            &program,
-                            if request.unmute {
-                                "limit-unmute"
-                            } else {
-                                "limit"
-                            },
-                            Some(request.maximum),
-                        )
-                        .await
-                    }
-                };
-                if let Err(error) = &result {
-                    eprintln!("Audio: {error}");
-                }
-                if let Work::Limit(request) = work {
-                    let success = result.is_ok();
-                    acknowledgement = Some((request, success));
-                }
-                let reading = result.ok();
-                // Once a confirmation fails, expires, or is contradicted, a later
-                // read must not revive it. Only a new request can authorize playback.
-                if let Some((request, success)) = &mut acknowledgement {
-                    *success &= limit_valid(request, now())
-                        && reading.is_some_and(|r| {
-                            r.volume <= request.maximum && (!request.unmute || !r.muted)
-                        });
-                }
-                let (request_id, limit_ok) = acknowledgement
-                    .as_ref()
-                    .map_or((None, false), |(request, success)| {
-                        (Some(request.request_id.as_ref()), *success)
-                    });
-                if published
-                    .as_ref()
-                    .is_some_and(|previous| previous.matches(reading, request_id, limit_ok))
-                {
-                    continue;
-                }
-                let state = State {
-                    volume: reading.map(|r| r.volume),
-                    muted: reading.map(|r| r.muted),
-                    available: reading.is_some(),
-                    request_id,
-                    limit_ok,
-                };
-                if client
-                    .publish(
-                        &state_topic,
-                        QoS::AtLeastOnce,
-                        true,
-                        serde_json::to_vec(&state).unwrap(),
-                    )
-                    .await
-                    .is_ok()
-                {
-                    published = Some(Published {
-                        reading,
-                        request_id: request_id.map(Into::into),
-                        limit_ok,
-                    });
-                }
-            }
-        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let connection_epoch = Rc::new(Cell::new(0));
+        tokio::task::spawn_local(Worker::new().run(
+            receiver,
+            program,
+            connection_epoch.clone(),
+            client,
+            state_topic,
+        ));
         Some(Self {
             topics,
             work: sender,
+            connection_epoch,
         })
     }
 
     pub fn connected(&self, client: &AsyncClient) {
+        self.connection_epoch
+            .set(self.connection_epoch.get().wrapping_add(1));
         client
             .try_subscribe(&self.topics.set, QoS::AtLeastOnce)
             .ok();

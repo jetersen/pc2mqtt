@@ -338,7 +338,7 @@ fn main() {
         .max_io_events_per_tick(64)
         .build()
         .expect("agent runtime")
-        .block_on(run_mqtt(&Config::load()));
+        .block_on(tokio::task::LocalSet::new().run_until(run_mqtt(&Config::load())));
 }
 
 fn mqtt_options(cfg: &Config, topics: &Topics) -> MqttOptions {
