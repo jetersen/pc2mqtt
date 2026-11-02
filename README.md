@@ -39,7 +39,8 @@ WantedBy=multi-user.target
 
 Set `PC2MQTT_AUDIO_COMMAND` to an absolute executable path to expose a speaker-volume
 number through MQTT discovery. The adapter must run in the desktop user's audio
-session. The agent times out helpers after two seconds. It accepts `read`, `set PERCENT`,
+session. The agent times out helpers after two seconds and limits stdout to
+256 bytes. It accepts `read`, `set PERCENT`,
 `limit PERCENT`, and `limit-unmute PERCENT`, returning `wpctl get-volume` output.
 Limits must never raise quieter output; `limit-unmute` must cap before unmuting.
 Audio reads run every five seconds to detect changes made outside MQTT. Unchanged

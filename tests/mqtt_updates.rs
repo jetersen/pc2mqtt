@@ -692,3 +692,43 @@ fn failed_or_blocked_launchers_report_failure_without_stalling_mqtt() {
             .contains("timed out")
     );
 }
+
+#[test]
+fn audio_output_is_bounded_and_a_valid_boundary_reading_still_confirms_caps() {
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-output-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let program = dir.join("adapter");
+    let line = "Volume: 0.30";
+    let output = format!("{line}{}", " ".repeat(257 - line.len()));
+    executable(&program, &format!("printf '%s' '{output}'"));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/volume/limit");
+    let request = |id: &str| serde_json::json!({"maximum":50,"request_id":id,"expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+20.0});
+    broker.publish_topic(
+        41,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        request("oversized").to_string().as_bytes(),
+    );
+    let result = broker.wait_for_audio("oversized");
+    assert_eq!(result["available"], false);
+    assert_eq!(result["limit_ok"], false);
+    let output = format!("{line}{}", " ".repeat(256 - line.len()));
+    executable(&program, &format!("printf '%s' '{output}'"));
+    broker.publish_topic(
+        42,
+        false,
+        false,
+        "fixture/audio/volume/limit",
+        request("bounded").to_string().as_bytes(),
+    );
+    let result = broker.wait_for_audio("bounded");
+    assert_eq!(result["available"], true);
+    assert_eq!(result["limit_ok"], true);
+    assert_eq!(result["volume"], 30.0);
+    drop(app);
+    fs::remove_dir_all(dir).unwrap();
+}

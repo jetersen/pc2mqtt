@@ -159,9 +159,6 @@ fn hostname() -> String {
 struct Topics {
     availability: String,
     power_availability: String,
-    discovery_power: String,
-    discovery_shutdown: String,
-    discovery_reboot: String,
     cmd_shutdown: String,
     cmd_reboot: String,
     cmd_update: String,
@@ -170,14 +167,9 @@ struct Topics {
 impl Topics {
     fn new(cfg: &Config) -> Self {
         let n = &cfg.device_name;
-        let id = &cfg.device_id;
-        let prefix = &cfg.mqtt.auto_discovery_prefix;
         Self {
             availability: format!("{n}/state"),
             power_availability: format!("{n}/binary_sensor/availability"),
-            discovery_power: format!("{prefix}/binary_sensor/{id}/{n}_sensor_power/config"),
-            discovery_shutdown: format!("{prefix}/button/{id}/{n}_button_shutdown/config"),
-            discovery_reboot: format!("{prefix}/button/{id}/{n}_button_reboot/config"),
             cmd_shutdown: format!("{n}/button/shutdown/command"),
             cmd_reboot: format!("{n}/button/reboot/command"),
             cmd_update: format!("{n}/button/update/command"),
@@ -213,7 +205,7 @@ struct DiscoveryConfig<'a> {
     qos: u8,
     // binary_sensor only
     #[serde(skip_serializing_if = "Option::is_none")]
-    state_topic: Option<String>,
+    state_topic: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_on: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +215,7 @@ struct DiscoveryConfig<'a> {
 fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
     let n = &cfg.device_name;
     let id = &cfg.device_id;
+    let prefix = &cfg.mqtt.auto_discovery_prefix;
     let avail = Availability {
         topic: &topics.availability,
         payload_available: "online",
@@ -241,7 +234,7 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
 
     let mut payloads = vec![
         (
-            topics.discovery_power.clone(),
+            format!("{prefix}/binary_sensor/{id}/{n}_sensor_power/config"),
             serde_json::to_string(&DiscoveryConfig {
                 device: device(),
                 availability: Some(power_avail),
@@ -251,14 +244,14 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
                 default_entity_id: format!("binary_sensor.{n}_sensor_power"),
                 unique_id: format!("{n}_sensor_power"),
                 qos: 1,
-                state_topic: Some(topics.availability.clone()),
+                state_topic: Some(&topics.availability),
                 payload_on: Some("online"),
                 payload_off: Some("offline"),
             })
             .unwrap(),
         ),
         (
-            topics.discovery_shutdown.clone(),
+            format!("{prefix}/button/{id}/{n}_button_shutdown/config"),
             serde_json::to_string(&DiscoveryConfig {
                 device: device(),
                 availability: Some(avail),
@@ -275,7 +268,7 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
             .unwrap(),
         ),
         (
-            topics.discovery_reboot.clone(),
+            format!("{prefix}/button/{id}/{n}_button_reboot/config"),
             serde_json::to_string(&DiscoveryConfig {
                 device: device(),
                 availability: Some(avail),
@@ -378,7 +371,7 @@ async fn run_mqtt(cfg: &Config) {
     if audio.is_some() {
         discoveries.push(audio::discovery(cfg));
     }
-    let mut initial_connect_done = false;
+    let mut discoveries = Some(discoveries);
 
     loop {
         let event = connection.poll().await;
@@ -392,13 +385,12 @@ async fn run_mqtt(cfg: &Config) {
                     updates.connected();
                 }
 
-                if !initial_connect_done {
-                    for (topic, payload) in &discoveries {
+                if let Some(discoveries) = discoveries.take() {
+                    for (topic, payload) in discoveries {
                         client
-                            .try_publish(topic, QoS::AtLeastOnce, true, payload.as_bytes())
+                            .try_publish(topic, QoS::AtLeastOnce, true, payload)
                             .ok();
                     }
-                    initial_connect_done = true;
                 }
 
                 client

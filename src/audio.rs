@@ -1,12 +1,14 @@
 //! Optional host audio adapter. Commands are argv, never shell input.
 use std::{
     path::PathBuf,
+    process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rumqttc::{AsyncClient, Publish, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 use crate::Config;
 
@@ -30,7 +32,7 @@ impl Topics {
 #[serde(deny_unknown_fields)]
 struct Limit {
     maximum: f64,
-    request_id: String,
+    request_id: Box<str>,
     expires_at: f64,
     #[serde(default)]
     unmute: bool,
@@ -89,7 +91,7 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Reading {
     volume: f64,
     muted: bool,
@@ -116,6 +118,9 @@ fn parse_reading(output: &str) -> Result<Reading, &'static str> {
     })
 }
 
+// wpctl emits one short line. Bound misbehaving adapters without growing Vecs.
+const MAX_AUDIO_OUTPUT: usize = 256;
+
 async fn execute(
     program: &PathBuf,
     operation: &str,
@@ -126,16 +131,66 @@ async fn execute(
     if let Some(value) = value {
         command.arg(value.to_string());
     }
-    command.kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(2), command.output())
-        .await
-        .map_err(|_| "audio adapter timed out")?
-        .map_err(|e| format!("audio adapter failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("audio adapter exited with {}", output.status));
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("audio adapter failed: {e}"))?;
+        let mut stdout = child.stdout.take().expect("piped audio output");
+        let mut output = [0; MAX_AUDIO_OUTPUT + 1];
+        let mut length = 0;
+        loop {
+            let read = stdout
+                .read(&mut output[length..])
+                .await
+                .map_err(|e| format!("audio adapter output failed: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            length += read;
+            if length > MAX_AUDIO_OUTPUT {
+                return Err("audio adapter output is too large".into());
+            }
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("audio adapter failed: {e}"))?;
+        if !status.success() {
+            return Err(format!("audio adapter exited with {status}"));
+        }
+        let text = std::str::from_utf8(&output[..length]).map_err(|_| "non-UTF8 audio output")?;
+        parse_reading(text).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| "audio adapter timed out".to_owned())?
+}
+
+#[derive(Serialize)]
+struct State<'a> {
+    volume: Option<f64>,
+    muted: Option<bool>,
+    available: bool,
+    request_id: Option<&'a str>,
+    limit_ok: bool,
+}
+
+// Keep only the values needed to detect a change, not a serialized JSON copy.
+struct Published {
+    reading: Option<Reading>,
+    request_id: Option<Box<str>>,
+    limit_ok: bool,
+}
+
+impl Published {
+    fn matches(&self, reading: Option<Reading>, request_id: Option<&str>, limit_ok: bool) -> bool {
+        self.reading == reading
+            && self.request_id.as_deref() == request_id
+            && self.limit_ok == limit_ok
     }
-    let output = std::str::from_utf8(&output.stdout).map_err(|_| "non-UTF8 audio output")?;
-    parse_reading(output).map_err(str::to_owned)
 }
 
 pub struct Audio {
@@ -150,11 +205,11 @@ impl Audio {
             "PC2MQTT_AUDIO_COMMAND must be absolute"
         );
         let topics = Topics::new(&cfg.device_name);
-        let worker_topics = topics.clone();
+        let state_topic = topics.state.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let mut acknowledgement: Option<(Limit, bool)> = None;
-            let mut published = None;
+            let mut published: Option<Published> = None;
             loop {
                 let work = match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await
                 {
@@ -209,28 +264,36 @@ impl Audio {
                 let (request_id, limit_ok) = acknowledgement
                     .as_ref()
                     .map_or((None, false), |(request, success)| {
-                        (Some(&request.request_id), *success)
+                        (Some(request.request_id.as_ref()), *success)
                     });
-                let state = json!({
-                    "volume": reading.map(|r| r.volume),
-                    "muted": reading.map(|r| r.muted),
-                    "available": reading.is_some(),
-                    "request_id": request_id,
-                    "limit_ok": limit_ok,
-                })
-                .to_string();
-                if published.as_ref() != Some(&state)
-                    && client
-                        .publish(
-                            &worker_topics.state,
-                            QoS::AtLeastOnce,
-                            true,
-                            state.as_bytes(),
-                        )
-                        .await
-                        .is_ok()
+                if published
+                    .as_ref()
+                    .is_some_and(|previous| previous.matches(reading, request_id, limit_ok))
                 {
-                    published = Some(state);
+                    continue;
+                }
+                let state = State {
+                    volume: reading.map(|r| r.volume),
+                    muted: reading.map(|r| r.muted),
+                    available: reading.is_some(),
+                    request_id,
+                    limit_ok,
+                };
+                if client
+                    .publish(
+                        &state_topic,
+                        QoS::AtLeastOnce,
+                        true,
+                        serde_json::to_vec(&state).unwrap(),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    published = Some(Published {
+                        reading,
+                        request_id: request_id.map(Into::into),
+                        limit_ok,
+                    });
                 }
             }
         });
