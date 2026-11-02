@@ -65,17 +65,20 @@ impl MqttConfig {
         let Some(endpoint) = &self.url else {
             return MqttOptions::new(client_id, &self.host, self.port);
         };
-        let url = url::Url::parse(endpoint).expect("invalid MQTT URL");
+        let url: http::Uri = endpoint.parse().expect("invalid MQTT URL");
+        let authority = url.authority().expect("MQTT URL requires a host");
         assert!(
-            url.username().is_empty() && url.password().is_none(),
+            !authority.as_str().contains('@'),
             "use the MQTT credential fields"
         );
         assert!(
-            url.fragment().is_none() && url.query().is_none(),
+            !endpoint.contains('#') && url.query().is_none(),
             "MQTT URL must not have a query or fragment"
         );
-        let host = url.host_str().expect("MQTT URL requires a host");
-        let (transport, port, websocket) = match url.scheme() {
+        let host = authority.host();
+        assert!(!host.is_empty(), "MQTT URL requires a host");
+        let scheme = url.scheme_str().expect("MQTT URL requires a scheme");
+        let (transport, port, websocket) = match scheme.to_ascii_lowercase().as_str() {
             "mqtt" => (Transport::Tcp, 1883, false),
             "mqtts" => (tls_transport(false), 8883, false),
             "ws" => (Transport::Ws, 80, true),
@@ -86,11 +89,19 @@ impl MqttConfig {
             websocket || url.path().is_empty() || url.path() == "/",
             "TCP MQTT URLs must not have a path"
         );
-        let mut opts = MqttOptions::new(
-            client_id,
-            if websocket { endpoint } else { host },
-            url.port().unwrap_or(port),
-        );
+        // Uri::port_u16() returns None for both absent and invalid ports.
+        // Validate an explicit port instead of silently choosing the default.
+        let port = match authority.as_str()[host.len()..].strip_prefix(':') {
+            None | Some("") => port,
+            Some(value) => {
+                assert!(
+                    value.bytes().all(|b| b.is_ascii_digit()),
+                    "invalid MQTT port"
+                );
+                value.parse::<u16>().expect("invalid MQTT port")
+            }
+        };
+        let mut opts = MqttOptions::new(client_id, if websocket { endpoint } else { host }, port);
         opts.set_transport(transport);
         opts
     }
@@ -456,6 +467,63 @@ async fn run_mqtt(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_uris_preserve_schemes_ports_ipv6_and_websocket_paths() {
+        for (endpoint, host, port) in [
+            ("mqtt://localhost", "localhost", 1883),
+            ("mqtts://broker.example:8884/", "broker.example", 8884),
+            ("mqtt://[::1]:1884", "[::1]", 1884),
+            (
+                "ws://broker.example/socket",
+                "ws://broker.example/socket",
+                80,
+            ),
+            (
+                "wss://mqtt.jetersen.dev/socket",
+                "wss://mqtt.jetersen.dev/socket",
+                443,
+            ),
+            (
+                "wss://broker.example:9443/a%20b",
+                "wss://broker.example:9443/a%20b",
+                9443,
+            ),
+        ] {
+            let mut config = Config::default();
+            config.mqtt.url = Some(endpoint.into());
+            assert_eq!(
+                config.mqtt.options("test".into()).broker_address(),
+                (host.into(), port)
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_uris_reject_credentials_queries_fragments_and_invalid_ports() {
+        for endpoint in [
+            "wss://user:password@broker.example/socket",
+            "mqtt://user@broker.example",
+            "wss://broker.example/socket?query",
+            "wss://broker.example/socket#fragment",
+            "mqtt://broker.example?",
+            "mqtt://broker.example/path",
+            "mqtt://broker.example:65536",
+            "mqtt://broker.example:invalid",
+            "mqtt://broker.example:+1883",
+            "mqtt://:1883",
+            "mqtt:///",
+            "https://broker.example/socket",
+            "broker.example:1883",
+        ] {
+            let mut config = Config::default();
+            config.mqtt.url = Some(endpoint.into());
+            assert!(
+                std::panic::catch_unwind(|| config.mqtt.options("test".into())).is_err(),
+                "accepted {endpoint}"
+            );
+        }
+    }
 
     #[test]
     fn rejects_retained_and_invalid_commands() {
