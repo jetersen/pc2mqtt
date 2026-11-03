@@ -370,11 +370,12 @@ fn audio_caps_are_correlated_and_unmute_is_confirmed() {
 // Linux-only, opt-in release benchmark. No live services or audio are used.
 // Run with: cargo test --release --target x86_64-unknown-linux-gnu --test mqtt_updates benchmark_idle -- --ignored --nocapture
 #[test]
-#[ignore = "60+ seconds of isolated process measurements"]
+#[ignore = "6+ minutes of isolated process measurements"]
 #[cfg(target_os = "linux")]
 fn benchmark_idle() {
     use std::os::unix::fs::PermissionsExt;
     fn sample(pid: u32) -> serde_json::Value {
+        let started = Instant::now();
         let root = format!("/proc/{pid}");
         let stat = fs::read_to_string(format!("{root}/stat")).unwrap();
         let fields: Vec<_> = stat[stat.rfind(')').unwrap() + 2..]
@@ -431,20 +432,34 @@ fn benchmark_idle() {
             }
         }
         result.insert("context_switches".into(), switches.into());
+        result.insert(
+            "sample_us".into(),
+            (started.elapsed().as_micros() as u64).into(),
+        );
         result.into()
     }
     fn measure(app: &App, broker: &mut Broker, label: &str) {
         let before = sample(app.child.id());
         let started = Instant::now();
         let mut packets = 0;
-        while started.elapsed() < Duration::from_secs(15) {
-            if let Some((header, body)) = broker.read(Duration::from_secs(1)) {
+        let mut publications = 0;
+        let duration = Duration::from_secs(
+            std::env::var("PC2MQTT_BENCH_SECONDS")
+                .map_or(185, |s| s.parse().expect("benchmark seconds")),
+        );
+        while started.elapsed() < duration {
+            if let Some((header, body)) = broker.read(
+                duration
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_millis(1)),
+            ) {
                 broker.respond(header, &body);
                 packets += 1;
+                publications += usize::from(header >> 4 == 3);
             }
         }
         println!(
-            "BENCH {label} seconds={:.3} packets={packets} before={before} after={}",
+            "BENCH {label} seconds={:.3} packets={packets} publications={publications} before={before} after={}",
             started.elapsed().as_secs_f64(),
             sample(app.child.id())
         );

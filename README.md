@@ -146,10 +146,12 @@ cargo test --release --target x86_64-unknown-linux-gnu --test mqtt_updates bench
 It samples `/proc` at each window's boundaries, reporting RSS/PSS/private memory
 in KiB, reserved virtual size, thread count, CPU ticks (use `getconf CLK_TCK`),
 minor faults, and aggregate thread context switches. It also counts MQTT packets
-and fixture helper calls. Connected and reconnected windows last 15 seconds;
-broker waiting and connection-refused windows last five seconds. Audio is enabled
-by default; set `PC2MQTT_BENCH_ALL=1` to also measure it disabled. The mock broker blocks between packets and
-responds to keepalives. `PC2MQTT_TEST_BINARY` selects a saved release binary for
+and fixture helper calls. Connected and reconnected windows default to 185 seconds,
+covering three 60-second MQTT keepalives; set `PC2MQTT_BENCH_SECONDS` to change
+their duration. It reports sampling time in microseconds. Broker waiting and
+connection-refused windows last five seconds. Audio is enabled by default; set
+`PC2MQTT_BENCH_ALL=1` to also measure it disabled. The mock broker blocks between
+packets and responds to keepalives. `PC2MQTT_TEST_BINARY` selects a saved release binary for
 comparisons. Context switches are a wakeup proxy, not a hardware wakeup counter.
 
 For 30 correlated music-preparation round trips through the mock adapter:
