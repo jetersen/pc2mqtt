@@ -101,7 +101,17 @@ impl MqttConfig {
                 value.parse::<u16>().expect("invalid MQTT port")
             }
         };
-        let mut opts = MqttOptions::new(client_id, if websocket { endpoint } else { host }, port);
+        let mut opts = MqttOptions::new(
+            client_id,
+            if websocket {
+                endpoint
+            } else {
+                host.strip_prefix('[')
+                    .and_then(|v| v.strip_suffix(']'))
+                    .unwrap_or(host)
+            },
+            port,
+        );
         opts.set_transport(transport);
         opts
     }
@@ -391,7 +401,10 @@ async fn run_mqtt(cfg: Config) {
     if audio.is_some() {
         discoveries.push(audio::discovery(&cfg));
     }
-    let mut discoveries = Some(discoveries);
+    let discoveries: Vec<_> = discoveries
+        .into_iter()
+        .map(|(topic, payload)| (topic, bytes::Bytes::from(payload)))
+        .collect();
     // MQTT owns its connection settings; release the startup configuration copy.
     drop(cfg);
 
@@ -407,21 +420,14 @@ async fn run_mqtt(cfg: Config) {
                     updates.connected();
                 }
 
-                if let Some(discoveries) = discoveries.take() {
-                    for (topic, payload) in discoveries {
-                        if !rumqttc::valid_topic(&topic) {
-                            continue;
-                        }
-                        client
-                            .publish_bytes(
-                                topic,
-                                QoS::AtLeastOnce,
-                                true,
-                                payload.into_bytes().into(),
-                            )
-                            .await
-                            .ok();
+                for (topic, payload) in &discoveries {
+                    if !rumqttc::valid_topic(topic) {
+                        continue;
                     }
+                    client
+                        .publish_bytes(topic, QoS::AtLeastOnce, true, payload.clone())
+                        .await
+                        .ok();
                 }
 
                 client
@@ -511,7 +517,7 @@ mod tests {
         for (endpoint, host, port) in [
             ("mqtt://localhost", "localhost", 1883),
             ("mqtts://broker.example:8884/", "broker.example", 8884),
-            ("mqtt://[::1]:1884", "[::1]", 1884),
+            ("mqtt://[::1]:1884", "::1", 1884),
             (
                 "ws://broker.example/socket",
                 "ws://broker.example/socket",

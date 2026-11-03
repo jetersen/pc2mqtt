@@ -71,6 +71,11 @@ impl App {
         if let Some(audio) = audio {
             command.env("PC2MQTT_AUDIO_COMMAND", audio);
         }
+        if directory.join("ca.pem").exists() {
+            command
+                .env("SSL_CERT_FILE", directory.join("ca.pem"))
+                .env("SSL_CERT_DIR", directory);
+        }
         if quiet {
             command.stderr(Stdio::null());
         }
@@ -180,6 +185,9 @@ impl Broker {
     }
 
     fn respond(&mut self, header: u8, body: &[u8]) {
+        self.respond_with_ack(header, body, true);
+    }
+    fn respond_with_ack(&mut self, header: u8, body: &[u8], ack: bool) {
         if header >> 4 == 3 {
             let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
             let offset = 2 + length + if header & 6 == 0 { 0 } else { 2 };
@@ -190,7 +198,7 @@ impl Broker {
             ));
         }
         match header >> 4 {
-            3 if header & 6 == 2 => {
+            3 if header & 6 == 2 && ack => {
                 let topic_length = usize::from(u16::from_be_bytes([body[0], body[1]]));
                 let id = &body[2 + topic_length..4 + topic_length];
                 self.0.write_all(&[0x40, 2, id[0], id[1]]).unwrap();
@@ -890,4 +898,254 @@ echo 'Volume: 0.30'
     );
     drop(app);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn discovery_is_republished_after_an_interrupted_initial_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _app = App::start(listener.local_addr().unwrap().port());
+    let mut first = Broker::accept(&listener, false);
+    loop {
+        let (header, body) = first.read(Duration::from_secs(3)).unwrap();
+        if header >> 4 == 3 {
+            break;
+        }
+        first.respond(header, &body);
+    }
+    first.0.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(first);
+    let mut second = Broker::accept(&listener, false);
+    second.wait_for_subscription();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !second
+        .1
+        .iter()
+        .any(|(topic, _, _)| topic.ends_with("_button_reboot/config"))
+    {
+        assert!(Instant::now() < deadline, "missing rediscovery");
+        if let Some((header, body)) = second.read(Duration::from_millis(100)) {
+            second.respond(header, &body);
+        }
+    }
+    assert!(
+        second
+            .1
+            .iter()
+            .any(|(topic, _, _)| topic.ends_with("_button_shutdown/config"))
+    );
+    assert!(
+        second
+            .1
+            .iter()
+            .any(|(topic, _, _)| topic.ends_with("_button_reboot/config"))
+    );
+}
+
+#[test]
+fn old_session_commands_are_discarded_and_running_helpers_are_cancelled() {
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-epoch-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let program = dir.join("adapter");
+    executable(
+        &program,
+        &format!(
+            "echo \"$1\" >> '{}/calls'\nif test \"$1\" = set; then sleep 1.7; fi\necho 'Volume: 0.30'",
+            dir.display()
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/music/set");
+    broker.publish_topic(40, false, false, "fixture/audio/volume/set", b"20");
+    thread::sleep(Duration::from_millis(80));
+    let request = serde_json::json!({"request_id":"old-session","expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+20.0});
+    for id in 41..49 {
+        broker.publish_topic(
+            id,
+            false,
+            false,
+            "fixture/audio/music/set",
+            request.to_string().as_bytes(),
+        );
+        assert!(broker.acknowledged(id, Duration::from_secs(1)));
+    }
+    broker.0.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(broker);
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/music/set");
+    while let Some((h, b)) = broker.read(Duration::from_millis(300)) {
+        broker.respond(h, &b);
+    }
+    assert!(
+        !fs::read_to_string(dir.join("calls"))
+            .unwrap()
+            .contains("limit-unmute")
+    );
+    assert!(
+        !broker
+            .1
+            .iter()
+            .any(|(t, p, _)| t.ends_with("/audio/volume/state")
+                && serde_json::from_slice::<serde_json::Value>(p).unwrap()["limit_ok"] == true)
+    );
+    drop(_app);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn helper_descendants_cannot_mutate_after_failure() {
+    for oversized in [false, true] {
+        let dir = std::env::temp_dir().join(format!("pc2mqtt-tree-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let program = dir.join("adapter");
+        let nested = dir.join("nested");
+        executable(
+            &nested,
+            &format!("sleep 3; echo late > '{}/late'", dir.display()),
+        );
+        executable(
+            &program,
+            &format!(
+                "if test \"$1\" = read; then echo 'Volume: 0.30'; exit; fi\n{}\nsh '{}' & wait",
+                if oversized { "printf '%0300d' 0" } else { ":" },
+                nested.display()
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+        let mut broker = Broker::accept(&listener, false);
+        broker.wait_for_topic("fixture/audio/music/set");
+        let request = serde_json::json!({"request_id":"tree","expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+10.0});
+        broker.publish_topic(
+            40,
+            false,
+            false,
+            "fixture/audio/music/set",
+            request.to_string().as_bytes(),
+        );
+        assert_eq!(broker.wait_for_audio("tree")["limit_ok"], false);
+        thread::sleep(Duration::from_millis(3200));
+        assert!(!dir.join("late").exists());
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn delayed_success_carries_a_deadline_the_consumer_can_enforce() {
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-expiry-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let program = dir.join("adapter");
+    executable(&program, "echo 'Volume: 0.30'");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/audio/music/set");
+    broker.wait_for_audio_id(None);
+    let mut held = Vec::new();
+    for i in 0..8 {
+        broker.publish_topic(50 + i, false, false, "fixture/audio/volume/get", b"GET");
+        loop {
+            let (h, b) = broker.read(Duration::from_secs(2)).unwrap();
+            broker.respond_with_ack(h, &b, false);
+            if h >> 4 == 3 {
+                let len = usize::from(u16::from_be_bytes([b[0], b[1]]));
+                held.push([b[2 + len], b[3 + len]]);
+                break;
+            }
+        }
+    }
+    let expiry = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        + 0.3;
+    let request = serde_json::json!({"request_id":"delayed","expires_at":expiry});
+    broker.publish_topic(
+        100,
+        false,
+        false,
+        "fixture/audio/music/set",
+        request.to_string().as_bytes(),
+    );
+    thread::sleep(Duration::from_millis(500));
+    for id in held {
+        broker.0.write_all(&[0x40, 2, id[0], id[1]]).unwrap();
+    }
+    let state = broker.wait_for_audio("delayed");
+    assert_eq!(state["expires_at"], expiry);
+    assert!(
+        state["expires_at"].as_f64().unwrap()
+            < SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+    );
+    drop(app);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn mqtts_connects_to_an_ipv6_literal_with_a_valid_ip_certificate() {
+    use rumqttc::tokio_rustls::{
+        TlsAcceptor,
+        rustls::{
+            ServerConfig,
+            pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+        },
+    };
+    let listener = match TcpListener::bind("[::1]:0") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("IPv6 unavailable: {e}");
+            return;
+        }
+    };
+    let cert = rcgen::generate_simple_self_signed(vec!["::1".into()]).unwrap();
+    let app_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut app = App::start(app_listener.local_addr().unwrap().port());
+    app.stop();
+    fs::write(app.directory.join("ca.pem"), cert.cert.pem()).unwrap();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(app.directory.join("config.json")).unwrap()).unwrap();
+    config["mqtt"]["url"] =
+        format!("mqtts://[::1]:{}", listener.local_addr().unwrap().port()).into();
+    fs::write(app.directory.join("config.json"), config.to_string()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert.cert.der().to_vec())],
+            PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+    let server = thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                tokio::time::timeout(Duration::from_secs(5), async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = TlsAcceptor::from(std::sync::Arc::new(tls))
+                        .accept(stream)
+                        .await
+                        .unwrap();
+                    let mut head = [0; 2];
+                    stream.read_exact(&mut head).await.unwrap();
+                    assert_eq!(head[0], 0x10);
+                    assert!(head[1] < 128);
+                    let mut body = vec![0; head[1] as usize];
+                    stream.read_exact(&mut body).await.unwrap();
+                    stream.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+                })
+                .await
+                .unwrap();
+            })
+    });
+    app.restart();
+    server.join().unwrap();
 }

@@ -40,7 +40,9 @@ WantedBy=multi-user.target
 Set `PC2MQTT_AUDIO_COMMAND` to an absolute executable path to expose a speaker-volume
 number through MQTT discovery. The adapter must run in the desktop user's audio
 session. The agent times out helpers after two seconds and limits stdout to
-256 bytes. It accepts `read`, `set PERCENT`,
+256 bytes. Helpers and their descendants must stay in their assigned process
+group; adapters must not create a new session or process group. The agent kills
+the group before starting another operation. It accepts `read`, `set PERCENT`,
 `limit PERCENT`, and `limit-unmute PERCENT`, returning `wpctl get-volume` output.
 Limits must never raise quieter output; `limit-unmute` must cap before unmuting.
 Audio reads run when MQTT connects, on commands, or when a non-retained `GET`
@@ -54,9 +56,11 @@ For music preparation, publish non-retained JSON to
 (Unix seconds within the next 60 seconds).
 The built-in profile atomically caps speaker volume at 50% without raising quieter
 output, then unmutes. The reply on `<device_name>/audio/volume/state` carries the
-same `request_id`; `limit_ok: true` means readback confirmed both steps. A failure
+same `request_id` and `expires_at`; `limit_ok: true` means readback confirmed both steps. A failure
 replies with `limit_ok: false`. Wait for the matching successful reply before
-starting playback. This profile controls host speakers; a media player's separate
+starting playback, and check the original request deadline immediately before
+playback. MQTT can deliver a queued success after its deadline; a matching ID
+alone cannot establish freshness. This profile controls host speakers; a media player's separate
 software volume remains the caller's responsibility.
 
 Ordinary `set` commands and correlated requests on `<device_name>/audio/volume/limit`

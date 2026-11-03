@@ -3,16 +3,12 @@ use std::{
     borrow::Cow,
     path::PathBuf,
     process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rumqttc::{AsyncClient, Publish, QoS};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::watch};
 
 use crate::Config;
 
@@ -63,6 +59,7 @@ const MUSIC_VOLUME_LIMIT: f64 = 50.0;
 enum Work {
     Read,
     Connected,
+    Disconnected,
     Publish,
     Set(f64),
     Limit(Limit),
@@ -190,6 +187,7 @@ async fn execute(
     program: &PathBuf,
     operation: &str,
     value: Option<f64>,
+    session: &watch::Receiver<Session>,
 ) -> Result<Reading, String> {
     let mut command = tokio::process::Command::new(program);
     command.arg(operation);
@@ -204,13 +202,19 @@ async fn execute(
         command.arg(std::str::from_utf8(&buffer[..length]).unwrap());
     }
     command
+        .process_group(0)
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("audio adapter failed: {e}"))?;
+    // Register before spawning, so an immediate exit cannot lose its wakeup.
+    let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .map_err(|e| e.to_string())?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("audio adapter failed: {e}"))?;
+    let mut group = ProcessGroup(Some(i32::try_from(child.id().expect("child PID")).unwrap()));
+    let mut cancellation = session.clone();
+    let operation = tokio::time::timeout(Duration::from_secs(2), async {
         let mut stdout = child.stdout.take().expect("piped audio output");
         let mut output = [0; MAX_AUDIO_OUTPUT + 1];
         let mut length = 0;
@@ -218,7 +222,7 @@ async fn execute(
             let read = stdout
                 .read(&mut output[length..])
                 .await
-                .map_err(|e| format!("audio adapter output failed: {e}"))?;
+                .map_err(|e| e.to_string())?;
             if read == 0 {
                 break;
             }
@@ -227,18 +231,60 @@ async fn execute(
                 return Err("audio adapter output is too large".into());
             }
         }
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("audio adapter failed: {e}"))?;
-        if !status.success() {
-            return Err(format!("audio adapter exited with {status}"));
+        // Observe exit without reaping the leader. Its PID cannot be reused
+        // before we have killed its remaining process group.
+        loop {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id().unwrap(),
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if status != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if unsafe { info.assume_init().si_pid() } != 0 {
+                break;
+            }
+            exits.recv().await.ok_or("child exit notification closed")?;
         }
         let text = std::str::from_utf8(&output[..length]).map_err(|_| "non-UTF8 audio output")?;
         parse_reading(text).map_err(str::to_owned)
-    })
-    .await
-    .map_err(|_| "audio adapter timed out".to_owned())?
+    });
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.changed() => Err("audio session changed during operation".into()),
+        result = operation => result.unwrap_or_else(|_| Err("audio adapter timed out".into())),
+    };
+
+    group.terminate();
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if !status.success() && result.is_ok() {
+        return Err(format!("audio adapter exited with {status}"));
+    }
+    result
+}
+
+// Adapters must keep all descendants in this group (no setsid or setpgid).
+struct ProcessGroup(Option<i32>);
+impl ProcessGroup {
+    fn terminate(&mut self) {
+        if let Some(pid) = self.0.take() {
+            // The unreaped leader pins this PGID. SIGKILL also stops helpers
+            // which ignore termination; no later command starts before cleanup.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 #[derive(Serialize)]
@@ -248,6 +294,7 @@ struct State<'a> {
     available: bool,
     request_id: Option<&'a str>,
     limit_ok: bool,
+    expires_at: Option<f64>,
 }
 
 // The ID itself lives only in the active request. A generation detects ID
@@ -273,6 +320,16 @@ fn state_payload(state: &State<'_>) -> Vec<u8> {
     buffer[..length].to_vec()
 }
 
+#[derive(Clone, Copy, Default)]
+struct Session {
+    epoch: u64,
+    connected: bool,
+}
+struct Accepted {
+    session: Session,
+    work: Work,
+}
+
 struct Worker {
     acknowledgement: Option<(Limit, bool)>,
     published: Option<Published>,
@@ -293,7 +350,11 @@ impl Worker {
             self.generation = self.generation.wrapping_add(1);
         }
     }
-    async fn next(&self, receiver: &mut tokio::sync::mpsc::Receiver<Work>) -> Option<Work> {
+    async fn next(
+        &self,
+        receiver: &mut tokio::sync::mpsc::Receiver<Accepted>,
+        session: &mut watch::Receiver<Session>,
+    ) -> Option<Accepted> {
         let expiry = self
             .acknowledgement
             .as_ref()
@@ -303,11 +364,23 @@ impl Worker {
                     + Duration::from_secs_f64((request.expires_at - now()).max(0.0))
             });
         tokio::select! {
+            biased;
+            change = session.changed() => {
+                change.ok()?;
+                let value = *session.borrow_and_update();
+                Some(Accepted { session: value, work: if value.connected { Work::Connected } else { Work::Disconnected } })
+            }
+            () = deadline(expiry) => Some(Accepted { session: *session.borrow(), work: Work::Publish }),
             work = receiver.recv() => work,
-            () = deadline(expiry) => Some(Work::Publish),
         }
     }
-    async fn perform(&mut self, work: Work, program: &PathBuf, connection_epoch: &AtomicU64) {
+    async fn perform(&mut self, work: Work, program: &PathBuf, session: &watch::Receiver<Session>) {
+        if matches!(work, Work::Disconnected) {
+            self.clear_confirmation();
+            self.reading = None;
+            self.published = None;
+            return;
+        }
         if matches!(work, Work::Publish) {
             return;
         }
@@ -318,10 +391,10 @@ impl Worker {
         if matches!(work, Work::Connected | Work::Set(_)) {
             self.clear_confirmation();
         }
-        let epoch = connection_epoch.load(Ordering::Relaxed);
+        let epoch = session.borrow().epoch;
         let mut result = match &work {
-            Work::Read | Work::Connected => execute(program, "read", None).await,
-            Work::Set(value) => execute(program, "set", Some(*value)).await,
+            Work::Read | Work::Connected => execute(program, "read", None, session).await,
+            Work::Set(value) => execute(program, "set", Some(*value), session).await,
             Work::Limit(request) => {
                 execute(
                     program,
@@ -331,12 +404,13 @@ impl Worker {
                         "limit"
                     },
                     Some(request.maximum),
+                    session,
                 )
                 .await
             }
-            Work::Publish => unreachable!(),
+            Work::Publish | Work::Disconnected => unreachable!(),
         };
-        if epoch != connection_epoch.load(Ordering::Relaxed) {
+        if epoch != session.borrow().epoch {
             self.clear_confirmation();
             result = Err("MQTT reconnected during audio operation".into());
         }
@@ -379,6 +453,10 @@ impl Worker {
             available: self.reading.is_some(),
             request_id,
             limit_ok,
+            expires_at: self
+                .acknowledgement
+                .as_ref()
+                .map(|(request, _)| request.expires_at),
         };
         if client
             .publish_bytes(topic, QoS::AtLeastOnce, true, state_payload(&state).into())
@@ -394,25 +472,26 @@ impl Worker {
     }
     async fn run(
         mut self,
-        mut receiver: tokio::sync::mpsc::Receiver<Work>,
+        mut receiver: tokio::sync::mpsc::Receiver<Accepted>,
         program: PathBuf,
-        connection_epoch: Arc<AtomicU64>,
+        mut session: watch::Receiver<Session>,
         client: AsyncClient,
         topic: String,
     ) {
-        let mut seen_epoch = 0;
-        while let Some(work) = self.next(&mut receiver).await {
-            if seen_epoch != connection_epoch.load(Ordering::Relaxed) {
-                self.clear_confirmation();
-                self.published = None;
-                seen_epoch = connection_epoch.load(Ordering::Relaxed);
+        while let Some(accepted) = self.next(&mut receiver, &mut session).await {
+            let current = *session.borrow();
+            if accepted.session.epoch != current.epoch {
+                continue;
             }
-            if let Work::Limit(request) = &work
+            if !current.connected && !matches!(accepted.work, Work::Disconnected) {
+                continue;
+            }
+            if let Work::Limit(request) = &accepted.work
                 && !limit_valid(request, now())
             {
                 continue;
             }
-            self.perform(work, &program, &connection_epoch).await;
+            self.perform(accepted.work, &program, &session).await;
             self.publish(&client, &topic).await;
         }
     }
@@ -427,8 +506,8 @@ async fn deadline(deadline: Option<tokio::time::Instant>) {
 
 pub struct Audio {
     topics: Topics,
-    work: tokio::sync::mpsc::Sender<Work>,
-    connection_epoch: Arc<AtomicU64>,
+    work: tokio::sync::mpsc::Sender<Accepted>,
+    session: watch::Sender<Session>,
 }
 impl Audio {
     pub fn start(client: AsyncClient, cfg: &Config) -> Option<Self> {
@@ -440,29 +519,25 @@ impl Audio {
         let topics = Topics::new(&cfg.device_name);
         let state_topic = topics.topic("volume/state");
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let connection_epoch = Arc::new(AtomicU64::new(0));
-        tokio::spawn(Worker::new().run(
-            receiver,
-            program,
-            connection_epoch.clone(),
-            client,
-            state_topic,
-        ));
+        let (session, sessions) = watch::channel(Session::default());
+        tokio::spawn(Worker::new().run(receiver, program, sessions, client, state_topic));
         Some(Self {
             topics,
             work: sender,
-            connection_epoch,
+            session,
         })
     }
 
     pub fn connected(&self, client: &AsyncClient) {
-        self.connection_epoch.fetch_add(1, Ordering::Relaxed);
+        self.session.send_modify(|state| {
+            state.epoch = state.epoch.wrapping_add(1);
+            state.connected = true;
+        });
         for suffix in ["volume/set", "volume/limit", "volume/get", "music/set"] {
             client
                 .try_subscribe(self.topics.topic(suffix), QoS::AtLeastOnce)
                 .ok();
         }
-        self.work.try_send(Work::Connected).ok();
     }
 
     pub fn handle(&self, publish: &Publish) {
@@ -473,12 +548,24 @@ impl Audio {
             &self.topics,
             now(),
         ) {
-            self.work.try_send(work).ok();
+            self.work
+                .try_send(Accepted {
+                    session: *self.session.borrow(),
+                    work,
+                })
+                .ok();
         }
     }
 
     pub fn disconnected(&self) {
-        self.connection_epoch.fetch_add(1, Ordering::Relaxed);
+        self.session.send_if_modified(|state| {
+            if !state.connected {
+                return false;
+            }
+            state.epoch = state.epoch.wrapping_add(1);
+            state.connected = false;
+            true
+        });
     }
 }
 
@@ -525,7 +612,7 @@ pub fn discovery(cfg: &Config) -> (String, String) {
         command_topic: Joined(&[n, "/audio/volume/set"]), state_topic: state,
         value_template: "{{ value_json.volume }}",
         json_attributes_topic: state,
-        json_attributes_template: "{{ dict(request_id=value_json.request_id, limit_ok=value_json.limit_ok, muted=value_json.muted) | tojson }}",
+        json_attributes_template: "{{ dict(request_id=value_json.request_id, limit_ok=value_json.limit_ok, muted=value_json.muted, expires_at=value_json.expires_at) | tojson }}",
         availability_mode: "all",
         availability: [
             AudioAvailability { topic: Joined(&[n, "/state"]), payload_available: "online", payload_not_available: "offline", value_template: None },
@@ -641,6 +728,7 @@ mod tests {
             available: true,
             request_id: Some(&id),
             limit_ok: true,
+            expires_at: Some(110.0),
         };
         let payload = state_payload(&state);
         assert!(payload.len() <= 384);
