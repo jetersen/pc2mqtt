@@ -5,7 +5,7 @@ mod audio;
 mod deployment;
 mod updates;
 
-use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS, Transport};
+use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use std::{fmt, io, path::PathBuf, time::Duration};
 use uuid::Uuid;
@@ -36,6 +36,8 @@ struct MqttConfig {
     host: String,
     #[serde(default = "default_port")]
     port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface: Option<String>,
     username: String,
     password: String,
     auto_discovery_prefix: String,
@@ -43,21 +45,6 @@ struct MqttConfig {
 
 fn default_port() -> u16 {
     1883
-}
-
-fn tls_transport(websocket: bool) -> Transport {
-    let mut tls = rumqttc::TlsConfiguration::default();
-    if let rumqttc::TlsConfiguration::Rustls(config) = &mut tls {
-        // This client connects to one broker, not hundreds of different servers.
-        std::sync::Arc::get_mut(config)
-            .expect("new TLS config")
-            .resumption = rumqttc::tokio_rustls::rustls::client::Resumption::in_memory_sessions(1);
-    }
-    if websocket {
-        Transport::wss_with_config(tls)
-    } else {
-        Transport::tls_with_config(tls)
-    }
 }
 
 impl MqttConfig {
@@ -78,21 +65,18 @@ impl MqttConfig {
         let host = authority.host();
         assert!(!host.is_empty(), "MQTT URL requires a host");
         let scheme = url.scheme_str().expect("MQTT URL requires a scheme");
-        let (transport, port, websocket) = match scheme.to_ascii_lowercase().as_str() {
-            "mqtt" => (Transport::Tcp, 1883, false),
-            "mqtts" => (tls_transport(false), 8883, false),
-            "ws" => (Transport::Ws, 80, true),
-            "wss" => (tls_transport(true), 443, true),
-            _ => panic!("MQTT URL scheme must be mqtt, mqtts, ws, or wss"),
-        };
         assert!(
-            websocket || url.path().is_empty() || url.path() == "/",
+            scheme.eq_ignore_ascii_case("mqtt"),
+            "MQTT URL scheme must be mqtt"
+        );
+        assert!(
+            url.path().is_empty() || url.path() == "/",
             "TCP MQTT URLs must not have a path"
         );
         // Uri::port_u16() returns None for both absent and invalid ports.
         // Validate an explicit port instead of silently choosing the default.
         let port = match authority.as_str()[host.len()..].strip_prefix(':') {
-            None | Some("") => port,
+            None | Some("") => default_port(),
             Some(value) => {
                 assert!(
                     value.bytes().all(|b| b.is_ascii_digit()),
@@ -101,19 +85,13 @@ impl MqttConfig {
                 value.parse::<u16>().expect("invalid MQTT port")
             }
         };
-        let mut opts = MqttOptions::new(
+        MqttOptions::new(
             client_id,
-            if websocket {
-                endpoint
-            } else {
-                host.strip_prefix('[')
-                    .and_then(|v| v.strip_suffix(']'))
-                    .unwrap_or(host)
-            },
+            host.strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap_or(host),
             port,
-        );
-        opts.set_transport(transport);
-        opts
+        )
     }
 }
 
@@ -148,9 +126,10 @@ impl Default for Config {
             device_name: hostname.to_lowercase(),
             updates: false,
             mqtt: MqttConfig {
-                url: Some("wss://YOUR-MQTT-HOST/socket".into()),
+                url: Some("mqtt://YOUR-TAILSCALE-HOST:1883".into()),
                 host: "YOUR MQTT HOST".into(),
                 port: 1883,
+                interface: None,
                 username: "MQTT USER".into(),
                 password: "MQTT PASSWORD".into(),
                 auto_discovery_prefix: "homeassistant".into(),
@@ -392,6 +371,10 @@ async fn run_mqtt(cfg: Config) {
     let (client, mut connection) = AsyncClient::new(opts, MQTT_QUEUE_CAPACITY);
     // A small state reply must not wait behind the command's TCP acknowledgement.
     connection.network_options.set_tcp_nodelay(true);
+    if let Some(interface) = &cfg.mqtt.interface {
+        assert!(!interface.is_empty(), "MQTT interface must not be empty");
+        connection.network_options.set_bind_device(interface);
+    }
     let updates = cfg.updates.then(|| {
         updates::Updates::start(client.clone(), &cfg.device_name)
             .expect("could not start update handler")
@@ -513,26 +496,12 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_uris_preserve_schemes_ports_ipv6_and_websocket_paths() {
+    fn endpoint_uris_preserve_tcp_hosts_ports_and_ipv6() {
         for (endpoint, host, port) in [
             ("mqtt://localhost", "localhost", 1883),
-            ("mqtts://broker.example:8884/", "broker.example", 8884),
+            ("mqtt://broker.example:1884/", "broker.example", 1884),
             ("mqtt://[::1]:1884", "::1", 1884),
-            (
-                "ws://broker.example/socket",
-                "ws://broker.example/socket",
-                80,
-            ),
-            (
-                "wss://mqtt.jetersen.dev/socket",
-                "wss://mqtt.jetersen.dev/socket",
-                443,
-            ),
-            (
-                "wss://broker.example:9443/a%20b",
-                "wss://broker.example:9443/a%20b",
-                9443,
-            ),
+            ("MQTT://broker.example", "broker.example", 1883),
         ] {
             let mut config = Config::default();
             config.mqtt.url = Some(endpoint.into());
@@ -546,10 +515,10 @@ mod tests {
     #[test]
     fn endpoint_uris_reject_credentials_queries_fragments_and_invalid_ports() {
         for endpoint in [
-            "wss://user:password@broker.example/socket",
+            "mqtt://user:password@broker.example",
             "mqtt://user@broker.example",
-            "wss://broker.example/socket?query",
-            "wss://broker.example/socket#fragment",
+            "mqtt://broker.example/?query",
+            "mqtt://broker.example/#fragment",
             "mqtt://broker.example?",
             "mqtt://broker.example/path",
             "mqtt://broker.example:65536",
@@ -558,6 +527,9 @@ mod tests {
             "mqtt://:1883",
             "mqtt:///",
             "https://broker.example/socket",
+            "mqtts://broker.example",
+            "ws://broker.example/socket",
+            "wss://broker.example/socket",
             "broker.example:1883",
         ] {
             let mut config = Config::default();
@@ -576,18 +548,6 @@ mod tests {
         for payload in [b"".as_slice(), b"press", b"PRESS\n", b"reboot"] {
             assert!(!accepts_command(false, payload));
         }
-    }
-
-    #[test]
-    fn secure_websocket_preserves_path_and_port() {
-        let mut config = Config::default();
-        config.mqtt.url = Some("wss://mqtt.example.org/socket".into());
-        let options = config.mqtt.options("test".into());
-        assert_eq!(
-            options.broker_address(),
-            ("wss://mqtt.example.org/socket".into(), 443)
-        );
-        assert!(matches!(options.transport(), Transport::Wss(_)));
     }
 
     #[test]

@@ -71,11 +71,6 @@ impl App {
         if let Some(audio) = audio {
             command.env("PC2MQTT_AUDIO_COMMAND", audio);
         }
-        if directory.join("ca.pem").exists() {
-            command
-                .env("SSL_CERT_FILE", directory.join("ca.pem"))
-                .env("SSL_CERT_DIR", directory);
-        }
         if quiet {
             command.stderr(Stdio::null());
         }
@@ -1089,7 +1084,8 @@ fn delayed_success_carries_a_deadline_the_consumer_can_enforce() {
         broker.0.write_all(&[0x40, 2, id[0], id[1]]).unwrap();
     }
     let state = broker.wait_for_audio("delayed");
-    assert_eq!(state["expires_at"], expiry);
+    // JSON floating-point parsing can round the Unix timestamp by one ULP.
+    assert!((state["expires_at"].as_f64().unwrap() - expiry).abs() <= f64::EPSILON * expiry);
     assert!(
         state["expires_at"].as_f64().unwrap()
             < SystemTime::now()
@@ -1102,14 +1098,7 @@ fn delayed_success_carries_a_deadline_the_consumer_can_enforce() {
 }
 
 #[test]
-fn mqtts_connects_to_an_ipv6_literal_with_a_valid_ip_certificate() {
-    use rumqttc::tokio_rustls::{
-        TlsAcceptor,
-        rustls::{
-            ServerConfig,
-            pki_types::{CertificateDer, PrivatePkcs8KeyDer},
-        },
-    };
+fn mqtt_connects_to_an_ipv6_literal() {
     let listener = match TcpListener::bind("[::1]:0") {
         Ok(v) => v,
         Err(e) => {
@@ -1117,50 +1106,63 @@ fn mqtts_connects_to_an_ipv6_literal_with_a_valid_ip_certificate() {
             return;
         }
     };
-    let cert = rcgen::generate_simple_self_signed(vec!["::1".into()]).unwrap();
     let app_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut app = App::start(app_listener.local_addr().unwrap().port());
     app.stop();
-    fs::write(app.directory.join("ca.pem"), cert.cert.pem()).unwrap();
-    let mut config: serde_json::Value =
-        serde_json::from_slice(&fs::read(app.directory.join("config.json")).unwrap()).unwrap();
+    let path = app.directory.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     config["mqtt"]["url"] =
-        format!("mqtts://[::1]:{}", listener.local_addr().unwrap().port()).into();
-    fs::write(app.directory.join("config.json"), config.to_string()).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let tls = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(cert.cert.der().to_vec())],
-            PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
-        )
-        .unwrap();
-    let server = thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                tokio::time::timeout(Duration::from_secs(5), async move {
-                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let mut stream = TlsAcceptor::from(std::sync::Arc::new(tls))
-                        .accept(stream)
-                        .await
-                        .unwrap();
-                    let mut head = [0; 2];
-                    stream.read_exact(&mut head).await.unwrap();
-                    assert_eq!(head[0], 0x10);
-                    assert!(head[1] < 128);
-                    let mut body = vec![0; head[1] as usize];
-                    stream.read_exact(&mut body).await.unwrap();
-                    stream.write_all(&[0x20, 2, 0, 0]).await.unwrap();
-                })
-                .await
-                .unwrap();
-            })
-    });
+        format!("mqtt://[::1]:{}", listener.local_addr().unwrap().port()).into();
+    config["mqtt"]["interface"] = "lo".into();
+    fs::write(path, config.to_string()).unwrap();
     app.restart();
-    server.join().unwrap();
+    let mut broker = Broker::accept(&listener, false);
+    broker.wait_for_topic("fixture/button/update/command");
+    broker.publish(51, false, false);
+    assert!(broker.acknowledged(51, Duration::from_secs(1)));
+    app.wait_for_requests(2);
+}
+
+#[test]
+fn a_missing_mqtt_interface_never_falls_back_to_another_route() {
+    use std::io::BufRead;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut app = App::start(listener.local_addr().unwrap().port());
+    app.stop();
+    // Discard any connection accepted before applying the test configuration.
+    while listener.accept().is_ok() {}
+    let path = app.directory.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["mqtt"]["interface"] = "pc2mqtt-missing".into();
+    fs::write(path, config.to_string()).unwrap();
+    app.child = Command::new(binary())
+        .env("PC2MQTT_CONFIG", app.directory.join("config.json"))
+        .env_remove("PC2MQTT_AUDIO_COMMAND")
+        .env("PC2MQTT_UPDATE_SOCKET", app.directory.join("update.sock"))
+        .env("PC2MQTT_UPDATE_RESULT", app.directory.join("result.json"))
+        .env("PC2MQTT_UPDATE_COMMAND", app.directory.join("updater"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = app.child.stderr.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line.contains("Connection error:") {
+                send.send(line).unwrap();
+                break;
+            }
+        }
+    });
+    let result = receive.recv_timeout(Duration::from_secs(3));
+    app.stop();
+    reader.join().unwrap();
+    assert!(result.is_ok(), "client never reported its bind failure");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
 }

@@ -79,7 +79,8 @@ On first start, pc2mqtt creates `/etc/pc2mqtt/config.json` unless `PC2MQTT_CONFI
   "device_id": "63fbeebb-f107-4903-ab36-6104b9d802b0",
   "device_name": "my-hostname",
   "mqtt": {
-    "url": "wss://mqtt.jetersen.dev/socket",
+    "url": "mqtt://mqtt.example.ts.net:1883",
+    "interface": "tailscale0",
     "username": "MQTT USER",
     "password": "MQTT PASSWORD",
     "auto_discovery_prefix": "homeassistant"
@@ -87,9 +88,13 @@ On first start, pc2mqtt creates `/etc/pc2mqtt/config.json` unless `PC2MQTT_CONFI
 }
 ```
 
-`mqtt.url` supports `mqtt://`, `mqtts://`, `ws://`, and `wss://`. TLS uses the
-system trust store and verifies the broker certificate and hostname. Existing
-`host` and `port` configurations continue to use plain TCP.
+The client supports raw MQTT over TCP (`mqtt://`), without TLS or WebSockets.
+Use an encrypted tunnel such as Tailscale for connections outside a trusted network.
+Optional `mqtt.interface` binds every connection attempt to that Linux interface;
+an unavailable interface fails without falling back to another route. Use a broker's
+Tailscale hostname with `"interface": "tailscale0"` to keep the client connection
+inside the tunnel. MQTT authentication and broker topic permissions still apply.
+Existing `host` and `port` configurations also use TCP.
 
 Commands require the payload `PRESS`. Retained command replays are ignored.
 Publish commands without retention; MQTT can forward a newly retained publication
