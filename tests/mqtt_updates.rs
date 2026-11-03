@@ -68,18 +68,8 @@ impl App {
     fn spawn(directory: &std::path::Path, audio: Option<&std::path::Path>, quiet: bool) -> Child {
         let mut command = Command::new(binary());
         command.env_remove("PC2MQTT_AUDIO_COMMAND");
-        command.env_remove("PC2MQTT_AUDIO_SOCKET");
-        command.env_remove("PC2MQTT_AUDIO_EVENT_SOCKET");
         if let Some(audio) = audio {
             command.env("PC2MQTT_AUDIO_COMMAND", audio);
-            command.env(
-                "PC2MQTT_AUDIO_EVENT_SOCKET",
-                directory.join("audio-events.sock"),
-            );
-            if quiet && let Some(socket) = std::env::var_os("PC2MQTT_BENCH_PIPEWIRE_SOCKET") {
-                command.env_remove("PC2MQTT_AUDIO_EVENT_SOCKET");
-                command.env("PC2MQTT_AUDIO_SOCKET", socket);
-            }
         }
         if quiet {
             command.stderr(Stdio::null());
@@ -96,17 +86,10 @@ impl App {
     fn stop(&mut self) {
         self.child.kill().ok();
         self.child.wait().ok();
-        fs::remove_file(self.directory.join("audio-events.sock")).ok();
     }
     fn restart(&mut self) {
         self.stop();
         self.child = Self::spawn(&self.directory, self.audio.as_deref(), self.quiet);
-    }
-    fn audio_changed(&self, event: u8) {
-        std::os::unix::net::UnixDatagram::unbound()
-            .unwrap()
-            .send_to(&[event], self.directory.join("audio-events.sock"))
-            .unwrap();
     }
     fn report(&self, result: &str, status: &str) {
         assert!(
@@ -618,17 +601,17 @@ fn expired_and_contradicted_audio_confirmations_cannot_authorize_playback() {
     );
     assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], true);
     fs::write(&reading, "Volume: 0.90\n").unwrap();
-    app.audio_changed(b'C');
+    broker.publish_topic(60, false, false, "fixture/audio/volume/get", b"GET");
     assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], false);
     fs::write(&reading, "Volume: 0.30\n").unwrap();
-    app.audio_changed(b'C');
+    broker.publish_topic(61, false, false, "fixture/audio/volume/get", b"GET");
     assert_eq!(broker.wait_for_audio("contradicted")["limit_ok"], false);
     drop(app);
     fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn audio_waits_for_events_expires_without_polling_and_invalidates_speaker_swaps() {
+fn audio_reads_only_on_requests_and_expires_without_polling() {
     let dir = std::env::temp_dir().join(format!("pc2mqtt-events-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&dir).unwrap();
     let program = dir.join("adapter");
@@ -675,55 +658,58 @@ fn audio_waits_for_events_expires_without_polling_and_invalidates_speaker_swaps(
         request("speaker-swap", 20.0).to_string().as_bytes(),
     );
     assert_eq!(broker.wait_for_audio("speaker-swap")["limit_ok"], true);
-    app.audio_changed(b'R');
-    let state = broker.wait_for_audio_id(None);
-    assert_eq!(state["limit_ok"], false);
-    assert_eq!(state["volume"], 30.0);
-    assert_eq!(
-        calls(),
-        before + 2,
-        "only the command and reset should read"
-    );
-    app.audio_changed(b'D');
-    assert_eq!(broker.wait_for_audio_id(None)["available"], false);
+    broker.publish_topic(43, false, false, "fixture/audio/volume/get", b"GET");
+    assert_eq!(broker.wait_for_audio("speaker-swap")["volume"], 30.0);
+    assert_eq!(calls(), before + 2, "only the command and GET should read");
+    // A repeated GET must reply even when the reading has not changed.
+    broker.publish_topic(44, false, false, "fixture/audio/volume/get", b"GET");
+    assert_eq!(broker.wait_for_audio("speaker-swap")["volume"], 30.0);
     drop(app);
     fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn speaker_swap_during_cap_cannot_publish_a_successful_confirmation() {
-    let dir = std::env::temp_dir().join(format!("pc2mqtt-race-{}", uuid::Uuid::new_v4()));
+fn music_request_applies_the_profile_and_replies_only_after_readback() {
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-music-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&dir).unwrap();
     let program = dir.join("adapter");
+    let reading = dir.join("reading");
+    fs::write(&reading, "Volume: 0.30\n").unwrap();
     executable(
         &program,
         &format!(
-            "if test \"$1\" = limit; then touch '{}'/started; sleep 0.3; fi\necho 'Volume: 0.30'",
-            dir.display()
+            "if test \"$1\" != read; then test \"$1\" = limit-unmute && test \"$2\" = 50 || exit 1; fi\ncat '{}'",
+            reading.display()
         ),
     );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let app = App::start_with_audio(listener.local_addr().unwrap().port(), Some(&program));
     let mut broker = Broker::accept(&listener, false);
-    broker.wait_for_topic("fixture/audio/volume/limit");
-    let request = serde_json::json!({"maximum":50,"request_id":"racing-speaker",
-        "expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+10.0});
+    broker.wait_for_topic("fixture/audio/music/set");
+    let request = |id| {
+        serde_json::json!({"request_id":id,
+        "expires_at":SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+10.0})
+    };
     broker.publish_topic(
         41,
         false,
         false,
-        "fixture/audio/volume/limit",
-        request.to_string().as_bytes(),
+        "fixture/audio/music/set",
+        request("music-ready").to_string().as_bytes(),
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !dir.join("started").exists() {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(10));
-    }
-    app.audio_changed(b'R');
-    let state = broker.wait_for_audio("racing-speaker");
-    assert_eq!(state["limit_ok"], false);
-    assert_eq!(state["available"], false);
+    let state = broker.wait_for_audio("music-ready");
+    assert_eq!(state["limit_ok"], true);
+    assert_eq!(state["muted"], false);
+    assert_eq!(state["volume"], 30.0);
+    fs::write(&reading, "Volume: 0.30 [MUTED]\n").unwrap();
+    broker.publish_topic(
+        42,
+        false,
+        false,
+        "fixture/audio/music/set",
+        request("music-failed").to_string().as_bytes(),
+    );
+    assert_eq!(broker.wait_for_audio("music-failed")["limit_ok"], false);
     drop(app);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -851,6 +837,57 @@ fn audio_output_is_bounded_and_a_valid_boundary_reading_still_confirms_caps() {
     assert_eq!(result["available"], true);
     assert_eq!(result["limit_ok"], true);
     assert_eq!(result["volume"], 30.0);
+    drop(app);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+// Measures small-command latency without touching workstation audio.
+#[test]
+#[ignore = "isolated 30-request music preparation benchmark"]
+fn benchmark_audio_requests() {
+    let dir = std::env::temp_dir().join(format!("pc2mqtt-requests-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let program = dir.join("adapter");
+    executable(
+        &program,
+        &format!(
+            r#"echo "$1" >> '{}/calls'
+echo 'Volume: 0.30'
+"#,
+            dir.display()
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app = App::start_with_output(listener.local_addr().unwrap().port(), Some(&program), true);
+    let mut broker = Broker::accept(&listener, false);
+    broker.0.set_nodelay(true).unwrap();
+    broker.wait_for_topic("fixture/audio/music/set");
+    let mut elapsed = Vec::with_capacity(30);
+    for index in 0..30 {
+        let id = format!("bench-{index}");
+        let payload = serde_json::json!({"request_id":id, "expires_at":
+            SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()+20.0});
+        let started = Instant::now();
+        broker.publish_topic(
+            100 + index,
+            false,
+            false,
+            "fixture/audio/music/set",
+            payload.to_string().as_bytes(),
+        );
+        assert_eq!(broker.wait_for_audio(&id)["limit_ok"], true);
+        elapsed.push(started.elapsed().as_micros());
+    }
+    elapsed.sort_unstable();
+    println!(
+        "BENCH music_requests=30 median_us={} p95_us={} helper_calls={}",
+        elapsed[15],
+        elapsed[28],
+        fs::read_to_string(dir.join("calls"))
+            .unwrap()
+            .lines()
+            .count()
+    );
     drop(app);
     fs::remove_dir_all(dir).unwrap();
 }

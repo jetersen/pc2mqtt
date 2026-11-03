@@ -2,6 +2,7 @@
 use rumqttc::{AsyncClient, QoS};
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     fs, io,
     os::unix::{
         fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
@@ -29,14 +30,17 @@ pub fn request_local_update() -> io::Result<()> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ResultState {
-    state: String,
-    result: String,
-    exit_status: Option<String>,
+struct ResultState<'a> {
+    #[serde(borrow)]
+    state: Cow<'a, str>,
+    #[serde(borrow)]
+    result: Cow<'a, str>,
+    #[serde(borrow)]
+    exit_status: Option<Cow<'a, str>>,
     completed_at: u64,
 }
 
-fn save_result(result: &str, exit_status: Option<String>) -> io::Result<()> {
+fn save_result(result: &str, exit_status: Option<&str>) -> io::Result<()> {
     use io::Write;
     let state = ResultState {
         state: if result == "success" {
@@ -45,8 +49,8 @@ fn save_result(result: &str, exit_status: Option<String>) -> io::Result<()> {
             "failed"
         }
         .into(),
-        result: result.into(),
-        exit_status,
+        result: Cow::Borrowed(result),
+        exit_status: exit_status.map(Cow::Borrowed),
         completed_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -76,7 +80,7 @@ fn save_result(result: &str, exit_status: Option<String>) -> io::Result<()> {
 pub fn report_result() -> io::Result<()> {
     let result = std::env::var("SERVICE_RESULT")
         .map_err(|_| io::Error::other("SERVICE_RESULT is required"))?;
-    save_result(&result, std::env::var("EXIT_STATUS").ok())?;
+    save_result(&result, std::env::var("EXIT_STATUS").ok().as_deref())?;
     // The file survives agent downtime and broker outages. A wakeup is best effort.
     if let Ok(socket) = UnixDatagram::unbound() {
         let _ = socket.set_nonblocking(true);
@@ -118,7 +122,8 @@ fn latest_result() -> io::Result<String> {
         return Err(io::Error::other("upgrade result is too large"));
     }
     // Validate before forwarding a file to MQTT.
-    let result: ResultState = serde_json::from_slice(&fs::read(path)?)?;
+    let input = fs::read(path)?;
+    let result: ResultState<'_> = serde_json::from_slice(&input)?;
     Ok(serde_json::to_string(&result)?)
 }
 
@@ -179,7 +184,7 @@ impl Updates {
                 };
                 if request && let Err(error) = launch().await {
                     eprintln!("Could not start upgrade: {error}");
-                    if let Err(error) = save_result("launch-failed", Some(error)) {
+                    if let Err(error) = save_result("launch-failed", Some(&error)) {
                         eprintln!("Could not save upgrade failure: {error}");
                     }
                 }

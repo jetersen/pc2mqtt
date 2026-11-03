@@ -1,46 +1,63 @@
 //! Optional host audio adapter. Commands are argv, never shell input.
-mod events;
-
 use std::{
-    cell::Cell,
+    borrow::Cow,
     path::PathBuf,
     process::Stdio,
-    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rumqttc::{AsyncClient, Publish, QoS};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::Config;
 
-#[derive(Clone)]
 struct Topics {
-    state: String,
-    set: String,
-    limit: String,
+    prefix: Box<str>,
 }
 impl Topics {
     fn new(name: &str) -> Self {
         Self {
-            state: format!("{name}/audio/volume/state"),
-            set: format!("{name}/audio/volume/set"),
-            limit: format!("{name}/audio/volume/limit"),
+            prefix: format!("{name}/audio/").into_boxed_str(),
         }
+    }
+    fn topic(&self, suffix: &str) -> String {
+        format!("{}{suffix}", self.prefix)
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct Limit {
     maximum: f64,
     request_id: Box<str>,
     expires_at: f64,
+    unmute: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitCommand<'a> {
+    maximum: f64,
+    #[serde(borrow)]
+    request_id: Cow<'a, str>,
+    expires_at: f64,
     #[serde(default)]
     unmute: bool,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MusicCommand<'a> {
+    #[serde(borrow)]
+    request_id: Cow<'a, str>,
+    expires_at: f64,
+}
+
+const MUSIC_VOLUME_LIMIT: f64 = 50.0;
 
 #[derive(Debug)]
 enum Work {
@@ -56,16 +73,23 @@ fn percentage(value: f64) -> bool {
 }
 
 fn limit_valid(request: &Limit, now: f64) -> bool {
-    percentage(request.maximum)
-        && !request.request_id.is_empty()
-        && request.request_id.len() <= 128
-        && request
-            .request_id
+    valid_limit(
+        request.maximum,
+        &request.request_id,
+        request.expires_at,
+        now,
+    )
+}
+fn valid_limit(maximum: f64, request_id: &str, expires_at: f64, now: f64) -> bool {
+    percentage(maximum)
+        && !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        && request.expires_at.is_finite()
-        && request.expires_at > now
-        && request.expires_at <= now + 60.0
+        && expires_at.is_finite()
+        && expires_at > now
+        && expires_at <= now + 60.0
 }
 
 fn parse_command(
@@ -78,13 +102,49 @@ fn parse_command(
     if retained {
         return None;
     }
-    if topic == topics.set {
+    let topic = topic.strip_prefix(topics.prefix.as_ref())?;
+    if topic == "volume/get" && payload == b"GET" {
+        return Some(Work::Read);
+    }
+    if topic == "music/set" {
+        let request: MusicCommand<'_> = serde_json::from_slice(payload).ok()?;
+        if !valid_limit(
+            MUSIC_VOLUME_LIMIT,
+            &request.request_id,
+            request.expires_at,
+            now,
+        ) {
+            return None;
+        }
+        return Some(Work::Limit(Limit {
+            maximum: MUSIC_VOLUME_LIMIT,
+            request_id: request.request_id.into_owned().into_boxed_str(),
+            expires_at: request.expires_at,
+            unmute: true,
+        }));
+    }
+    if topic == "volume/set" {
         let value = std::str::from_utf8(payload).ok()?.parse().ok()?;
         return percentage(value).then_some(Work::Set(value));
     }
-    if topic == topics.limit {
-        let request: Limit = serde_json::from_slice(payload).ok()?;
-        return limit_valid(&request, now).then_some(Work::Limit(request));
+    if topic == "volume/limit" {
+        // Borrow ordinary JSON strings while validating. Only valid work gets
+        // an owned ID; retaining the whole MQTT buffer would use more memory.
+        let request: LimitCommand<'_> = serde_json::from_slice(payload).ok()?;
+        if !valid_limit(
+            request.maximum,
+            &request.request_id,
+            request.expires_at,
+            now,
+        ) {
+            return None;
+        }
+        return Some(Work::Limit(Limit {
+            maximum: request.maximum,
+            request_id: request.request_id.into_owned().into_boxed_str(),
+            expires_at: request.expires_at,
+            unmute: request.unmute,
+        }));
     }
     None
 }
@@ -134,7 +194,14 @@ async fn execute(
     let mut command = tokio::process::Command::new(program);
     command.arg(operation);
     if let Some(value) = value {
-        command.arg(value.to_string());
+        // Even the smallest positive finite f64 fits in 384 decimal bytes.
+        // Command copies this slice into argv; avoid a second temporary String.
+        let mut buffer = [0; 384];
+        let mut output = &mut buffer[..];
+        std::io::Write::write_fmt(&mut output, format_args!("{value}"))
+            .expect("bounded percentage argument");
+        let length = 384 - output.len();
+        command.arg(std::str::from_utf8(&buffer[..length]).unwrap());
     }
     command
         .kill_on_drop(true)
@@ -183,106 +250,75 @@ struct State<'a> {
     limit_ok: bool,
 }
 
-// Keep only the values needed to detect a change, not a serialized JSON copy.
+// The ID itself lives only in the active request. A generation detects ID
+// changes without copying it into the publication cache.
 struct Published {
     reading: Option<Reading>,
-    request_id: Option<Box<str>>,
+    generation: u64,
     limit_ok: bool,
 }
-
 impl Published {
-    fn matches(&self, reading: Option<Reading>, request_id: Option<&str>, limit_ok: bool) -> bool {
-        self.reading == reading
-            && self.request_id.as_deref() == request_id
-            && self.limit_ok == limit_ok
+    fn matches(&self, reading: Option<Reading>, generation: u64, limit_ok: bool) -> bool {
+        self.reading == reading && self.generation == generation && self.limit_ok == limit_ok
     }
+}
+
+// Validated IDs are <=128 ASCII bytes and readings are finite. Serialization
+// uses stack storage; MQTT then owns one exactly sized payload allocation.
+fn state_payload(state: &State<'_>) -> Vec<u8> {
+    let mut buffer = [0; 384];
+    let mut output = &mut buffer[..];
+    serde_json::to_writer(&mut output, state).expect("bounded audio state");
+    let length = 384 - output.len();
+    buffer[..length].to_vec()
 }
 
 struct Worker {
     acknowledgement: Option<(Limit, bool)>,
     published: Option<Published>,
     reading: Option<Reading>,
-    events: events::Events,
-    refresh: bool,
-    retry: Option<tokio::time::Instant>,
-    retry_delay: u64,
+    generation: u64,
 }
 impl Worker {
     fn new() -> Self {
-        let mut retry = None;
-        let events = events::Events::open().unwrap_or_else(|error| {
-            eprintln!("Audio events: {error}");
-            retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-            events::Events::Disabled
-        });
         Self {
             acknowledgement: None,
             published: None,
             reading: None,
-            events,
-            refresh: false,
-            retry,
-            retry_delay: 1,
+            generation: 0,
         }
     }
-    fn disconnected(&mut self) {
-        if self.events.disconnect() {
-            self.retry = Some(tokio::time::Instant::now() + Duration::from_secs(self.retry_delay));
-            self.retry_delay = (self.retry_delay * 2).min(60);
-        }
-        self.reading = None;
-    }
-    async fn next(&mut self, receiver: &mut tokio::sync::mpsc::Receiver<Work>) -> Option<Work> {
-        loop {
-            if std::mem::take(&mut self.refresh) {
-                return Some(Work::Read);
-            }
-            let expiry = self
-                .acknowledgement
-                .as_ref()
-                .filter(|(_, success)| *success)
-                .map(|(request, _)| {
-                    tokio::time::Instant::now()
-                        + Duration::from_secs_f64((request.expires_at - now()).max(0.0))
-                });
-            tokio::select! {
-                biased;
-                flags = self.events.next() => {
-                    if flags & events::RESET != 0 { self.acknowledgement = None; }
-                    if flags & events::DISCONNECTED != 0 {
-                        self.disconnected();
-                        return Some(Work::Publish);
-                    }
-                    if flags & events::CHANGED != 0 {
-                        self.retry_delay = 1;
-                        return Some(Work::Read);
-                    }
-                }
-                work = receiver.recv() => return work,
-                () = deadline(expiry) => return Some(Work::Publish),
-                () = deadline(self.retry) => {
-                    if let Ok(source) = events::Events::open() {
-                        self.events = source; self.retry = None;
-                    } else {
-                        self.retry_delay = (self.retry_delay * 2).min(60);
-                        self.retry = Some(tokio::time::Instant::now() + Duration::from_secs(self.retry_delay));
-                    }
-                }
-            }
+    fn clear_confirmation(&mut self) {
+        if self.acknowledgement.take().is_some() {
+            self.generation = self.generation.wrapping_add(1);
         }
     }
-    async fn perform(&mut self, work: Work, program: &PathBuf, connection_epoch: &Cell<u64>) {
+    async fn next(&self, receiver: &mut tokio::sync::mpsc::Receiver<Work>) -> Option<Work> {
+        let expiry = self
+            .acknowledgement
+            .as_ref()
+            .filter(|(_, success)| *success)
+            .map(|(request, _)| {
+                tokio::time::Instant::now()
+                    + Duration::from_secs_f64((request.expires_at - now()).max(0.0))
+            });
+        tokio::select! {
+            work = receiver.recv() => work,
+            () = deadline(expiry) => Some(Work::Publish),
+        }
+    }
+    async fn perform(&mut self, work: Work, program: &PathBuf, connection_epoch: &AtomicU64) {
         if matches!(work, Work::Publish) {
             return;
         }
-        if matches!(work, Work::Connected) {
-            self.acknowledgement = None;
+        if matches!(work, Work::Read | Work::Connected) {
+            // Explicit state requests always receive a fresh reply.
             self.published = None;
         }
-        if matches!(work, Work::Set(_)) {
-            self.acknowledgement = None;
+        if matches!(work, Work::Connected | Work::Set(_)) {
+            self.clear_confirmation();
         }
-        let epoch = connection_epoch.get();
+        let epoch = connection_epoch.load(Ordering::Relaxed);
         let mut result = match &work {
             Work::Read | Work::Connected => execute(program, "read", None).await,
             Work::Set(value) => execute(program, "set", Some(*value)).await,
@@ -300,34 +336,23 @@ impl Worker {
             }
             Work::Publish => unreachable!(),
         };
-        // A speaker swap or reconnect during a helper invalidates its result.
-        // Verify concurrent volume changes before publishing a cap confirmation.
-        let mut flags = self.events.drain();
-        if flags == events::CHANGED && result.is_ok() {
-            result = execute(program, "read", None).await;
-            flags = self.events.drain();
-            if flags & events::CHANGED != 0 {
-                result = Err("audio changed during confirmation".into());
-                self.refresh = true;
-            }
-        }
-        if flags & (events::RESET | events::DISCONNECTED) != 0 || epoch != connection_epoch.get() {
-            self.acknowledgement = None;
-            result = Err("audio session changed during operation".into());
-            self.refresh = flags & events::DISCONNECTED == 0;
-        }
-        if flags & events::DISCONNECTED != 0 {
-            self.disconnected();
+        if epoch != connection_epoch.load(Ordering::Relaxed) {
+            self.clear_confirmation();
+            result = Err("MQTT reconnected during audio operation".into());
         }
         if let Err(error) = &result {
             eprintln!("Audio: {error}");
         }
         if let Work::Limit(request) = work {
+            self.generation = self.generation.wrapping_add(1);
             self.acknowledgement = Some((request, result.is_ok()));
         }
         self.reading = result.ok();
     }
     async fn publish(&mut self, client: &AsyncClient, topic: &str) {
+        if !rumqttc::valid_topic(topic) {
+            return;
+        }
         // A failed, expired, or contradicted confirmation never revives.
         if let Some((request, success)) = &mut self.acknowledgement {
             *success &= limit_valid(request, now())
@@ -344,7 +369,7 @@ impl Worker {
         if self
             .published
             .as_ref()
-            .is_some_and(|previous| previous.matches(self.reading, request_id, limit_ok))
+            .is_some_and(|previous| previous.matches(self.reading, self.generation, limit_ok))
         {
             return;
         }
@@ -356,18 +381,13 @@ impl Worker {
             limit_ok,
         };
         if client
-            .publish(
-                topic,
-                QoS::AtLeastOnce,
-                true,
-                serde_json::to_vec(&state).unwrap(),
-            )
+            .publish_bytes(topic, QoS::AtLeastOnce, true, state_payload(&state).into())
             .await
             .is_ok()
         {
             self.published = Some(Published {
                 reading: self.reading,
-                request_id: request_id.map(Into::into),
+                generation: self.generation,
                 limit_ok,
             });
         }
@@ -376,16 +396,16 @@ impl Worker {
         mut self,
         mut receiver: tokio::sync::mpsc::Receiver<Work>,
         program: PathBuf,
-        connection_epoch: Rc<Cell<u64>>,
+        connection_epoch: Arc<AtomicU64>,
         client: AsyncClient,
         topic: String,
     ) {
         let mut seen_epoch = 0;
         while let Some(work) = self.next(&mut receiver).await {
-            if seen_epoch != connection_epoch.get() {
-                self.acknowledgement = None;
+            if seen_epoch != connection_epoch.load(Ordering::Relaxed) {
+                self.clear_confirmation();
                 self.published = None;
-                seen_epoch = connection_epoch.get();
+                seen_epoch = connection_epoch.load(Ordering::Relaxed);
             }
             if let Work::Limit(request) = &work
                 && !limit_valid(request, now())
@@ -408,7 +428,7 @@ async fn deadline(deadline: Option<tokio::time::Instant>) {
 pub struct Audio {
     topics: Topics,
     work: tokio::sync::mpsc::Sender<Work>,
-    connection_epoch: Rc<Cell<u64>>,
+    connection_epoch: Arc<AtomicU64>,
 }
 impl Audio {
     pub fn start(client: AsyncClient, cfg: &Config) -> Option<Self> {
@@ -417,17 +437,11 @@ impl Audio {
             program.is_absolute(),
             "PC2MQTT_AUDIO_COMMAND must be absolute"
         );
-        assert!(
-            cfg!(feature = "pipewire")
-                || std::env::var_os("PC2MQTT_AUDIO_SOCKET").is_none()
-                || std::env::var_os("PC2MQTT_AUDIO_EVENT_SOCKET").is_some(),
-            "PC2MQTT_AUDIO_SOCKET requires a build with --features pipewire"
-        );
         let topics = Topics::new(&cfg.device_name);
-        let state_topic = topics.state.clone();
+        let state_topic = topics.topic("volume/state");
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let connection_epoch = Rc::new(Cell::new(0));
-        tokio::task::spawn_local(Worker::new().run(
+        let connection_epoch = Arc::new(AtomicU64::new(0));
+        tokio::spawn(Worker::new().run(
             receiver,
             program,
             connection_epoch.clone(),
@@ -442,14 +456,12 @@ impl Audio {
     }
 
     pub fn connected(&self, client: &AsyncClient) {
-        self.connection_epoch
-            .set(self.connection_epoch.get().wrapping_add(1));
-        client
-            .try_subscribe(&self.topics.set, QoS::AtLeastOnce)
-            .ok();
-        client
-            .try_subscribe(&self.topics.limit, QoS::AtLeastOnce)
-            .ok();
+        self.connection_epoch.fetch_add(1, Ordering::Relaxed);
+        for suffix in ["volume/set", "volume/limit", "volume/get", "music/set"] {
+            client
+                .try_subscribe(self.topics.topic(suffix), QoS::AtLeastOnce)
+                .ok();
+        }
         self.work.try_send(Work::Connected).ok();
     }
 
@@ -464,34 +476,69 @@ impl Audio {
             self.work.try_send(work).ok();
         }
     }
+
+    pub fn disconnected(&self) {
+        self.connection_epoch.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
+#[derive(Serialize)]
+struct AudioAvailability<'a> {
+    topic: crate::Joined<'a>,
+    payload_available: &'static str,
+    payload_not_available: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_template: Option<&'static str>,
+}
+#[derive(Serialize)]
+struct AudioDiscovery<'a> {
+    device: crate::Device<'a>,
+    name: &'static str,
+    icon: &'static str,
+    unique_id: crate::Joined<'a>,
+    default_entity_id: crate::Joined<'a>,
+    command_topic: crate::Joined<'a>,
+    state_topic: crate::Joined<'a>,
+    value_template: &'static str,
+    json_attributes_topic: crate::Joined<'a>,
+    json_attributes_template: &'static str,
+    availability_mode: &'static str,
+    availability: [AudioAvailability<'a>; 2],
+    min: u8,
+    max: u8,
+    step: u8,
+    unit_of_measurement: &'static str,
+    mode: &'static str,
+    qos: u8,
+    retain: bool,
+}
 pub fn discovery(cfg: &Config) -> (String, String) {
-    let n = &cfg.device_name;
-    let topics = Topics::new(n);
-    let payload = json!({
-        "device": {"identifiers": cfg.device_id, "model": n, "name": n},
-        "name": "Speaker volume", "icon": "mdi:volume-high",
-        "unique_id": format!("{n}_speaker_volume"),
-        "default_entity_id": format!("number.{n}_speaker_volume"),
-        "command_topic": topics.set, "state_topic": topics.state,
-        "value_template": "{{ value_json.volume }}",
-        "json_attributes_topic": topics.state,
-        "json_attributes_template": "{{ dict(request_id=value_json.request_id, limit_ok=value_json.limit_ok, muted=value_json.muted) | tojson }}",
-        "availability_mode": "all",
-        "availability": [
-            {"topic": format!("{n}/state"), "payload_available": "online", "payload_not_available": "offline"},
-            {"topic": topics.state, "value_template": "{{ 'online' if value_json.available else 'offline' }}", "payload_available": "online", "payload_not_available": "offline"}
+    use crate::Joined;
+    let n = cfg.device_name.as_str();
+    let state_parts = [n, "/audio/volume/state"];
+    let state = Joined(&state_parts);
+    let payload = serde_json::to_string(&AudioDiscovery {
+        device: crate::Device { identifiers: &cfg.device_id, model: n, name: n },
+        name: "Speaker volume", icon: "mdi:volume-high",
+        unique_id: Joined(&[n, "_speaker_volume"]),
+        default_entity_id: Joined(&["number.", n, "_speaker_volume"]),
+        command_topic: Joined(&[n, "/audio/volume/set"]), state_topic: state,
+        value_template: "{{ value_json.volume }}",
+        json_attributes_topic: state,
+        json_attributes_template: "{{ dict(request_id=value_json.request_id, limit_ok=value_json.limit_ok, muted=value_json.muted) | tojson }}",
+        availability_mode: "all",
+        availability: [
+            AudioAvailability { topic: Joined(&[n, "/state"]), payload_available: "online", payload_not_available: "offline", value_template: None },
+            AudioAvailability { topic: state, payload_available: "online", payload_not_available: "offline", value_template: Some("{{ 'online' if value_json.available else 'offline' }}") },
         ],
-        "min": 0, "max": 100, "step": 1, "unit_of_measurement": "%", "mode": "box", "qos": 1, "retain": false,
-    });
+        min: 0, max: 100, step: 1, unit_of_measurement: "%", mode: "box", qos: 1, retain: false,
+    }).unwrap();
     (
         format!(
-            "{}/number/{id}/{n}_speaker_volume/config",
-            cfg.mqtt.auto_discovery_prefix,
-            id = cfg.device_id
+            "{}/number/{}/{n}_speaker_volume/config",
+            cfg.mqtt.auto_discovery_prefix, cfg.device_id
         ),
-        payload.to_string(),
+        payload,
     )
 }
 
@@ -521,20 +568,86 @@ mod tests {
         let topics = Topics::new("fixture");
         let limit = br#"{"maximum":50,"request_id":"cap-123","expires_at":110}"#;
         assert!(matches!(
-            parse_command(&topics.limit, limit, false, &topics, 100.0),
+            parse_command(&topics.topic("volume/limit"), limit, false, &topics, 100.0),
             Some(Work::Limit(_))
         ));
-        assert!(parse_command(&topics.limit, limit, true, &topics, 100.0).is_none());
-        assert!(parse_command(&topics.limit, limit, false, &topics, 110.0).is_none());
-        assert!(parse_command(&topics.limit, limit, false, &topics, 0.0).is_none());
+        assert!(
+            parse_command(&topics.topic("volume/limit"), limit, true, &topics, 100.0).is_none()
+        );
+        assert!(
+            parse_command(&topics.topic("volume/limit"), limit, false, &topics, 110.0).is_none()
+        );
+        assert!(parse_command(&topics.topic("volume/limit"), limit, false, &topics, 0.0).is_none());
         for value in [b"NaN".as_slice(), b"-1", b"101", b"50; reboot"] {
-            assert!(parse_command(&topics.set, value, false, &topics, 100.0).is_none());
+            assert!(
+                parse_command(&topics.topic("volume/set"), value, false, &topics, 100.0).is_none()
+            );
         }
         assert!(matches!(
-            parse_command(&topics.set, b"25", false, &topics, 100.0),
+            parse_command(&topics.topic("volume/set"), b"25", false, &topics, 100.0),
             Some(Work::Set(25.0))
         ));
-        assert!(parse_command(&topics.set, b"25", true, &topics, 100.0).is_none());
+        assert!(parse_command(&topics.topic("volume/set"), b"25", true, &topics, 100.0).is_none());
+    }
+
+    #[test]
+    fn music_profile_is_fixed_and_commands_reject_replays_or_overrides() {
+        let topics = Topics::new("fixture");
+        let payload = br#"{"request_id":"music-123","expires_at":110}"#;
+        let Some(Work::Limit(request)) =
+            parse_command(&topics.topic("music/set"), payload, false, &topics, 100.0)
+        else {
+            panic!("missing music work");
+        };
+        assert!((request.maximum - 50.0).abs() < f64::EPSILON);
+        assert!(request.unmute);
+        assert!(parse_command(&topics.topic("music/set"), payload, true, &topics, 100.0).is_none());
+        assert!(
+            parse_command(&topics.topic("music/set"), payload, false, &topics, 110.0).is_none()
+        );
+        for payload in [
+            br#"{"request_id":"music-123","expires_at":110,"maximum":100}"#.as_slice(),
+            br#"{"request_id":"music-123","expires_at":110,"unmute":false}"#,
+            br#"{"request_id":"music-123","request_id":"other","expires_at":110}"#,
+        ] {
+            assert!(
+                parse_command(&topics.topic("music/set"), payload, false, &topics, 100.0).is_none()
+            );
+        }
+        assert!(matches!(
+            parse_command(&topics.topic("volume/get"), b"GET", false, &topics, 100.0),
+            Some(Work::Read)
+        ));
+        assert!(parse_command(&topics.topic("volume/get"), b"GET", true, &topics, 100.0).is_none());
+        assert!(
+            parse_command(&topics.topic("volume/get"), b"other", false, &topics, 100.0).is_none()
+        );
+        // JSON escapes still work; borrowing does not narrow the accepted syntax.
+        let escaped = br#"{"request_id":"music-\u0031","expires_at":110}"#;
+        let Some(Work::Limit(request)) =
+            parse_command(&topics.topic("music/set"), escaped, false, &topics, 100.0)
+        else {
+            panic!("escaped ID rejected");
+        };
+        assert_eq!(&*request.request_id, "music-1");
+    }
+
+    #[test]
+    fn bounded_state_encoding_fits_the_largest_valid_request_id() {
+        let id = "a".repeat(128);
+        let state = State {
+            volume: Some(1000.0),
+            muted: Some(false),
+            available: true,
+            request_id: Some(&id),
+            limit_ok: true,
+        };
+        let payload = state_payload(&state);
+        assert!(payload.len() <= 384);
+        let state: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(state["request_id"], id);
+        assert_eq!(state["volume"], 1000.0);
+        assert_eq!(state["limit_ok"], true);
     }
 
     #[test]

@@ -7,7 +7,7 @@ mod updates;
 
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
-use std::{io, path::PathBuf, time::Duration};
+use std::{fmt, io, path::PathBuf, time::Duration};
 use uuid::Uuid;
 
 const GIT_SHA: &str = env!("GIT_SHA");
@@ -184,6 +184,24 @@ struct Device<'a> {
     name: &'a str,
 }
 
+// Stream composed discovery strings through Serde's escaping writer, without
+// allocating intermediate format! strings or hand-writing JSON escapes.
+#[derive(Clone, Copy)]
+struct Joined<'a>(&'a [&'a str]);
+impl fmt::Display for Joined<'_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for part in self.0 {
+            output.write_str(part)?;
+        }
+        Ok(())
+    }
+}
+impl Serialize for Joined<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Serialize, Clone, Copy)]
 struct Availability<'a> {
     topic: &'a str,
@@ -200,8 +218,8 @@ struct DiscoveryConfig<'a> {
     command_topic: Option<&'a str>,
     name: &'a str,
     icon: &'static str,
-    default_entity_id: String,
-    unique_id: String,
+    default_entity_id: Joined<'a>,
+    unique_id: Joined<'a>,
     qos: u8,
     // binary_sensor only
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,8 +259,8 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
                 command_topic: None,
                 name: "Power",
                 icon: "mdi:power",
-                default_entity_id: format!("binary_sensor.{n}_sensor_power"),
-                unique_id: format!("{n}_sensor_power"),
+                default_entity_id: Joined(&["binary_sensor.", n, "_sensor_power"]),
+                unique_id: Joined(&[n, "_sensor_power"]),
                 qos: 1,
                 state_topic: Some(&topics.availability),
                 payload_on: Some("online"),
@@ -258,8 +276,8 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
                 command_topic: Some(&topics.cmd_shutdown),
                 name: "Shutdown",
                 icon: "mdi:power",
-                default_entity_id: format!("button.{n}_button_shutdown"),
-                unique_id: format!("{n}_button_shutdown"),
+                default_entity_id: Joined(&["button.", n, "_button_shutdown"]),
+                unique_id: Joined(&[n, "_button_shutdown"]),
                 qos: 1,
                 state_topic: None,
                 payload_on: None,
@@ -275,8 +293,8 @@ fn discovery_payloads(cfg: &Config, topics: &Topics) -> Vec<(String, String)> {
                 command_topic: Some(&topics.cmd_reboot),
                 name: "Reboot",
                 icon: "mdi:restart",
-                default_entity_id: format!("button.{n}_button_reboot"),
-                unique_id: format!("{n}_button_reboot"),
+                default_entity_id: Joined(&["button.", n, "_button_reboot"]),
+                unique_id: Joined(&[n, "_button_reboot"]),
                 qos: 1,
                 state_topic: None,
                 payload_on: None,
@@ -338,7 +356,7 @@ fn main() {
         .max_io_events_per_tick(64)
         .build()
         .expect("agent runtime")
-        .block_on(tokio::task::LocalSet::new().run_until(run_mqtt(&Config::load())));
+        .block_on(run_mqtt(Config::load()));
 }
 
 fn mqtt_options(cfg: &Config, topics: &Topics) -> MqttOptions {
@@ -357,21 +375,25 @@ fn mqtt_options(cfg: &Config, topics: &Topics) -> MqttOptions {
     opts
 }
 
-async fn run_mqtt(cfg: &Config) {
-    let topics = Topics::new(cfg);
-    let opts = mqtt_options(cfg, &topics);
+async fn run_mqtt(cfg: Config) {
+    let topics = Topics::new(&cfg);
+    let opts = mqtt_options(&cfg, &topics);
 
     let (client, mut connection) = AsyncClient::new(opts, MQTT_QUEUE_CAPACITY);
+    // A small state reply must not wait behind the command's TCP acknowledgement.
+    connection.network_options.set_tcp_nodelay(true);
     let updates = cfg.updates.then(|| {
         updates::Updates::start(client.clone(), &cfg.device_name)
             .expect("could not start update handler")
     });
-    let audio = audio::Audio::start(client.clone(), cfg);
-    let mut discoveries = discovery_payloads(cfg, &topics);
+    let audio = audio::Audio::start(client.clone(), &cfg);
+    let mut discoveries = discovery_payloads(&cfg, &topics);
     if audio.is_some() {
-        discoveries.push(audio::discovery(cfg));
+        discoveries.push(audio::discovery(&cfg));
     }
     let mut discoveries = Some(discoveries);
+    // MQTT owns its connection settings; release the startup configuration copy.
+    drop(cfg);
 
     loop {
         let event = connection.poll().await;
@@ -387,8 +409,17 @@ async fn run_mqtt(cfg: &Config) {
 
                 if let Some(discoveries) = discoveries.take() {
                     for (topic, payload) in discoveries {
+                        if !rumqttc::valid_topic(&topic) {
+                            continue;
+                        }
                         client
-                            .try_publish(topic, QoS::AtLeastOnce, true, payload)
+                            .publish_bytes(
+                                topic,
+                                QoS::AtLeastOnce,
+                                true,
+                                payload.into_bytes().into(),
+                            )
+                            .await
                             .ok();
                     }
                 }
@@ -434,6 +465,9 @@ async fn run_mqtt(cfg: &Config) {
                 }
             }
             Err(e) => {
+                if let Some(audio) = &audio {
+                    audio.disconnected();
+                }
                 eprintln!("Connection error: {e} — retrying...");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -445,6 +479,32 @@ async fn run_mqtt(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_streams_composed_strings_with_json_escaping() {
+        let config = Config {
+            device_id: "id-\"🌍".into(),
+            device_name: "host\"\\name".into(),
+            updates: true,
+            ..Config::default()
+        };
+        let mut payloads = discovery_payloads(&config, &Topics::new(&config));
+        payloads.push(audio::discovery(&config));
+        for (_, payload) in payloads
+            .into_iter()
+            .filter(|(_, payload)| !payload.is_empty())
+        {
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["device"]["identifiers"], config.device_id);
+            assert_eq!(payload["device"]["name"], config.device_name);
+            assert!(
+                payload["unique_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&config.device_name)
+            );
+        }
+    }
 
     #[test]
     fn endpoint_uris_preserve_schemes_ports_ipv6_and_websocket_paths() {

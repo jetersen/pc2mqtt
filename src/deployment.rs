@@ -1,49 +1,73 @@
 //! Home Assistant discovery for the last completed system upgrade.
-pub fn discovery(cfg: &crate::Config) -> Vec<(String, String)> {
-    let n = &cfg.device_name;
-    let topic = format!("{n}/deployment/state");
-    let mut discoveries: Vec<_> = [(
-        "sensor",
-        "deployment",
-        "Deployment",
-        "mdi:package-variant",
-        "state",
-    )]
-    .into_iter()
-    .map(|(component, key, name, icon, field)| {
-        let mut payload = serde_json::json!({
-            "device": {"identifiers": cfg.device_id, "model": n, "name": n},
-            "availability": [{"topic": format!("{n}/state")}],
-            "name": name, "icon": icon,
-            "default_entity_id": format!("{component}.{n}_{key}"),
-            "unique_id": format!("{n}_{key}"), "qos": 1,
-            "state_topic": topic, "value_template": format!("{{{{ value_json.{field} }}}}"),
-            "entity_category": "diagnostic",
-        });
-        payload["json_attributes_topic"] = topic.clone().into();
+use crate::{Config, Device, Joined};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct ResultAvailability<'a> {
+    topic: Joined<'a>,
+}
+#[derive(Serialize)]
+struct ResultDiscovery<'a> {
+    device: Device<'a>,
+    availability: [ResultAvailability<'a>; 1],
+    name: &'static str,
+    icon: &'static str,
+    default_entity_id: Joined<'a>,
+    unique_id: Joined<'a>,
+    qos: u8,
+    state_topic: Joined<'a>,
+    value_template: &'static str,
+    entity_category: &'static str,
+    json_attributes_topic: Joined<'a>,
+}
+pub fn discovery(cfg: &Config) -> Vec<(String, String)> {
+    let n = cfg.device_name.as_str();
+    let state_parts = [n, "/deployment/state"];
+    let state = Joined(&state_parts);
+    let payload = serde_json::to_string(&ResultDiscovery {
+        device: Device {
+            identifiers: &cfg.device_id,
+            model: n,
+            name: n,
+        },
+        availability: [ResultAvailability {
+            topic: Joined(&[n, "/state"]),
+        }],
+        name: "Deployment",
+        icon: "mdi:package-variant",
+        default_entity_id: Joined(&["sensor.", n, "_deployment"]),
+        unique_id: Joined(&[n, "_deployment"]),
+        qos: 1,
+        state_topic: state,
+        value_template: "{{ value_json.state }}",
+        entity_category: "diagnostic",
+        json_attributes_topic: state,
+    })
+    .unwrap();
+    vec![
         (
             format!(
-                "{}/{component}/{}/{n}_{key}/config",
+                "{}/sensor/{}/{n}_deployment/config",
                 cfg.mqtt.auto_discovery_prefix, cfg.device_id
             ),
-            payload.to_string(),
-        )
-    })
-    .collect();
-    // Remove discovery left by the former Comin integration.
-    for (component, key) in [
-        ("sensor", "deployed_revision"),
-        ("binary_sensor", "reboot_required"),
-    ] {
-        discoveries.push((
+            payload,
+        ),
+        // Remove discovery left by the former Comin integration.
+        (
             format!(
-                "{}/{component}/{}/{n}_{key}/config",
+                "{}/sensor/{}/{n}_deployed_revision/config",
                 cfg.mqtt.auto_discovery_prefix, cfg.device_id
             ),
             String::new(),
-        ));
-    }
-    discoveries
+        ),
+        (
+            format!(
+                "{}/binary_sensor/{}/{n}_reboot_required/config",
+                cfg.mqtt.auto_discovery_prefix, cfg.device_id
+            ),
+            String::new(),
+        ),
+    ]
 }
 
 #[cfg(test)]
